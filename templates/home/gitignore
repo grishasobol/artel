@@ -1,0 +1,13 @@
+# artel user project root. Whitelist: Git includes only user files, skills, and submodule pointers.
+# Everything else in the home directory (harness state, keys, caches, scratch/) is ignored by default.
+/*
+!/.gitignore
+!/.gitmodules
+!/AGENTS.md
+!/CLAUDE.md
+!/README.md
+!/goal.md
+!/agents
+!/artel
+!/skills/
+!/src/

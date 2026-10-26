@@ -1,0 +1,7 @@
+# transient state of the artel system
+channel/inbox/
+channel/outbox/
+channel/archive/
+channel/*.alive
+.lock/
+state/

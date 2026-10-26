@@ -1,0 +1,4137 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+artel — utility commands for the artel system, agents, and the concierge session.
+
+Usage: artel <command> [arguments]   (details: artel help)
+Located in ARTEL_HOME/bin: the artel repository is a submodule of the user project root (in the container
+/home/artel/artel, bin/ is in PATH). Templates come from ARTEL_HOME/templates; the super agent's prompt
+library is in ARTEL_HOME/templates/prompts (read in place); the project root has only the super skill in skills/.
+
+Commands:
+  init       lay out the user project root: git, artel and agents submodules, skills/ linked into every harness
+  link       update skills/* and AGENTS.md symlinks in all harness skill and rules directories
+  skills     compare the project's skills/ with artel templates: update or remove untouched copies (--apply), show changes
+  prompts    prompt library: list | show <module> | status (which identities have changed sources)
+  env        environment overview (CLI, versions, models, scheduler) in Markdown
+  quota      quota snapshot (cache under 10 min old, --fresh to poll): claude, agy, codex via app-server, opencode by provider
+  notify     message the user without waiting for a reply
+  ask        ask the user and wait for a reply (exit code: 0 reply, 3 rejection, 124 timeout, 125 quiet hours)
+  channel    concierge session file channel: watch | pending | show | reply | archive | alive
+  journal    add an entry to agents/journal.md
+  team       agent spheres: init <name> (create team/<name>/ and a prompt) | status [--since] (STATE and new SUMMARY entries)
+  summary    add: add a run entry to team/<agent>/SUMMARY.md
+  lock       run a command under a lock (for example, edit planning/ROADMAP.md)
+  escalate   record an escalation for the super agent
+  snapshot   save a copy of a file in agents/history before changing it
+  mark/since time mark (for example, the end of a super agent management iteration) and read the mark
+  run        run an agent from config.yaml [--task name]: prepare script, slot queue, harness, hard limit, log
+  slot       slot status (holder, queue, --history N)
+  schedule   project schedule: slots and their load, agents with tasks, systemd timers, structural notes
+  commit     commit the user project: agents/ to its git, then the root (submodules, skills/, goal.md); run does this itself
+  register   generate systemd --user units (timers and services) from agents/slots; --apply enables them
+  unregister disable and remove the project's units
+  cheatsheet one-screen reminder of how to manage the project container (host and inside commands)
+
+The user project's agents/ directory is searched for upward from the current directory or taken from $ARTEL_AD.
+The agent name comes from --agent or $ARTEL_AGENT. Child run processes receive $ARTEL_HOME and PATH with ARTEL_HOME/bin.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import getpass
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+
+EXIT_OK, EXIT_ERR, EXIT_CFG, EXIT_REJECTED, EXIT_TIMEOUT, EXIT_QUIET = 0, 1, 2, 3, 124, 125
+ALIVE_TTL_SEC = 900          # concierge is alive if concierge.alive is newer than this
+DEFAULT_ASK_TIMEOUT = 300    # seconds to wait for a reply when --timeout is not set
+
+
+# ───────────────────────── common utilities ─────────────────────────
+
+def now() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def stamp(t: dt.datetime | None = None) -> str:
+    return (t or now()).strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def iso(t: dt.datetime | None = None) -> str:
+    return (t or now()).isoformat(timespec="seconds")
+
+
+def human(t: dt.datetime | None = None) -> str:
+    return (t or now()).strftime("%Y-%m-%d %H:%M")
+
+
+def die(msg: str, code: int = EXIT_ERR) -> None:
+    print(f"artel: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def expand(p) -> Path:
+    return Path(os.path.expanduser(str(p)))
+
+
+def find_ad() -> Path:
+    env = os.environ.get("ARTEL_AD")
+    if env:
+        p = expand(env)
+        if (p / "config.yaml").exists():
+            return p
+        die(f"$ARTEL_AD={env}, but it has no config.yaml", EXIT_CFG)
+    cur = Path.cwd().resolve()
+    for d in [cur, *cur.parents]:
+        if d.name == "agents" and (d / "config.yaml").exists():
+            return d
+        if (d / "agents" / "config.yaml").exists():
+            return d / "agents"
+    die("agents/config.yaml not found above the current directory; set $ARTEL_AD", EXIT_CFG)
+    raise SystemExit  # for the type checker
+
+
+def artel_home() -> Path:
+    """The artel repository directory: above bin/, where this script lives (including through a symlink). It contains
+    charter.md and templates/, which `artel init` lays out in a user project; agents do not edit it."""
+    return Path(__file__).resolve().parent.parent
+
+
+def yaml_mod():
+    try:
+        import yaml  # type: ignore
+        return yaml
+    except ImportError:
+        die("PyYAML module required (pip install pyyaml)", EXIT_CFG)
+
+
+def load_cfg(ad: Path):
+    yaml = yaml_mod()
+    try:
+        data = yaml.safe_load((ad / "config.yaml").read_text(encoding="utf-8")) or {}
+    except Exception as e:  # noqa: BLE001
+        die(f"cannot parse config.yaml: {e}", EXIT_CFG)
+    if not isinstance(data, dict):
+        die("config.yaml root must be a mapping", EXIT_CFG)
+    return data, (data.get("artel") or {})
+
+
+def cget(s: dict, path: str, default=None):
+    cur = s
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return default if cur is None else cur
+
+
+def agent_name(a) -> str:
+    return getattr(a, "agent", None) or os.environ.get("ARTEL_AGENT") or "agent"
+
+
+def read_text_arg(text: str | None) -> str:
+    if text is None or text == "-":
+        data = sys.stdin.read()
+        if not data.strip():
+            die("empty text (expected an argument or stdin)")
+        return data.strip()
+    return text.strip()
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def append_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
+
+
+def parse_front(text: str):
+    """Frontmatter of the form `---\\nkey: value\\n---\\nbody`. Returns (meta, body)."""
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {}, text
+    meta: dict[str, str] = {}
+    for line in text[4:end].splitlines():
+        if ":" in line and not line.lstrip().startswith("#"):
+            k, v = line.split(":", 1)
+            meta[k.strip()] = v.strip()
+    return meta, text[end + 5:]
+
+
+def render_front(meta: dict, body: str) -> str:
+    lines = ["---"] + [f"{k}: {v}" for k, v in meta.items() if v is not None and v != ""] + ["---", body.rstrip("\n"), ""]
+    return "\n".join(lines)
+
+
+def parse_duration(spec: str) -> int:
+    """'30m', '2h', '90s', '1d', or a bare number (seconds) → seconds."""
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd]?)\s*", spec or "")
+    if not m:
+        die(f"cannot parse duration: {spec!r}")
+    n, unit = int(m[1]), m[2] or "s"
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+
+
+def in_quiet_hours(s: dict, t: dt.datetime | None = None) -> bool:
+    spec = str(cget(s, "channel.quiet_hours", "") or "").strip()
+    if not spec:
+        return False
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})", spec)
+    if not m:
+        return False
+    t = t or now()
+    cur = t.hour * 60 + t.minute
+    a = int(m[1]) * 60 + int(m[2])
+    b = int(m[3]) * 60 + int(m[4])
+    return (a <= cur < b) if a <= b else (cur >= a or cur < b)
+
+
+def journal_write(ad: Path, agent: str, kind: str, text: str) -> None:
+    append_text(ad / "journal.md", f"\n## {human()} · {agent} · {kind}\n{text.rstrip()}\n")
+
+
+def project_name(ad: Path, s: dict) -> str:
+    return str(cget(s, "project") or ad.parent.name)
+
+
+def team_dir(ad: Path) -> Path:
+    """User project directory: the parent of agents/. By default, this is the container user's home directory,
+    containing src/<project repositories> and scratch/. It has its own git if the installer created one."""
+    return ad.parent
+
+
+def git_toplevel(path: Path) -> Path | None:
+    rc, so, _ = run_bin(["git", "-C", str(path), "rev-parse", "--show-toplevel"], timeout=15)
+    return Path(so.strip()) if rc == 0 and so.strip() else None
+
+
+GIT_IDENT = ["-c", "user.name=artel", "-c", "user.email=artel@localhost"]
+# what from the user project root goes into its git: user files and submodule pointers
+ROOT_TRACKED = ("agents", "artel", "skills", ".gitmodules", ".gitignore", "AGENTS.md", "CLAUDE.md", "goal.md", "README.md")
+
+
+def submodule_paths(root: Path) -> list[str]:
+    """Submodule paths from .gitmodules: only the pointers from src/ are committed, not the contents
+    of mounted directories without git."""
+    rc, so, _ = run_bin(["git", "-C", str(root), "config", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"], timeout=15)
+    return [line.split(None, 1)[1] for line in so.splitlines() if " " in line] if rc == 0 else []
+
+
+def git_commit_paths(repo: Path, paths: list[str], message: str) -> str:
+    """`git add -A` on explicit paths and commit if there is anything to commit: 'committed' | 'nothing' | 'error: …'."""
+    paths = [p for p in paths if (repo / p).exists() or (repo / p).is_symlink()]
+    if not paths:
+        return "nothing"
+    rc, _, se = run_bin(["git", "-C", str(repo), "add", "-A", "--", *paths], timeout=60)
+    if rc != 0:
+        return f"error: git add: {se.strip()[-300:]}"
+    rc, _, _ = run_bin(["git", "-C", str(repo), "diff", "--cached", "--quiet"], timeout=30)
+    if rc == 0:
+        return "nothing"
+    rc, _, se = run_bin(["git", "-C", str(repo), *GIT_IDENT, "commit", "-q", "-m", message], timeout=60)
+    return "committed" if rc == 0 else f"error: git commit: {se.strip()[-300:]}"
+
+
+COMMIT_LOCK_WAIT_SEC = 180
+
+
+def team_commit(ad: Path, s: dict, message: str) -> str:
+    """Commit the user project in two steps: first agents/ to its own repository (per its .gitignore),
+    then the root: submodule pointers (agents, artel, src/*), skills/, goal.md, AGENTS.md. Explicit paths instead of
+    `add -A`, because the home directory contains harness keys and state. If agents/ is not a separate repository
+    (the old layout), it is committed as an ordinary root directory. Agents in different slots finish runs
+    concurrently, so the commit uses an inter-process lock (flock on agents/state/.commit.lock).
+    Returns 'committed' | 'nothing' | 'disabled' | 'no-git' | 'error: ...'."""
+    if cget(s, "git.autocommit", True) is False:
+        return "disabled"
+    td = team_dir(ad)
+    if git_toplevel(td) != td.resolve():
+        return "no-git"
+    fd = os.open(state_dir(ad) / ".commit.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        deadline = time.time() + COMMIT_LOCK_WAIT_SEC
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() > deadline:
+                    return f"error: another run has been committing for over {COMMIT_LOCK_WAIT_SEC // 60} minutes; lock wait timed out"
+                time.sleep(1)
+        if git_toplevel(ad) == ad.resolve():
+            inner = git_commit_paths(ad, ["."], message)
+            if inner.startswith("error"):
+                return f"agents/: {inner}"
+        return git_commit_paths(td, [*ROOT_TRACKED, *submodule_paths(td)], message)
+    finally:
+        os.close(fd)   # closing the descriptor releases flock
+
+
+def cmd_commit(a) -> None:
+    ad = find_ad()
+    _, s = load_cfg(ad)
+    res = team_commit(ad, s, a.message or f"artel: {agent_name(a)} {human()}")
+    print(f"artel commit: {res} ({team_dir(ad)})")
+    if "error" in res:
+        sys.exit(EXIT_ERR)
+
+
+# ───────────────────────── init and link: user project layout ─────────────────────────
+
+# where each harness looks for skills (relative to the user project root, which is also $HOME)
+SKILL_DIRS = (".claude/skills", ".codex/skills", ".agents/skills", ".gemini/config/skills", ".config/opencode/skills", ".opencode/skills")
+# rules files: AGENTS.md in the root is the source; the others symlink to it
+RULE_LINKS = {"CLAUDE.md": "AGENTS.md", ".codex/AGENTS.md": "../AGENTS.md", ".config/opencode/AGENTS.md": "../../AGENTS.md"}
+
+
+def relink(link: Path, target: str) -> bool:
+    """Create the relative link -> target symlink, replacing a different symlink; leave ordinary files and directories alone.
+    Return True if anything changed."""
+    if link.is_symlink():
+        if os.readlink(link) == target:
+            return False
+        link.unlink()
+    elif link.exists():
+        return False
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    return True
+
+
+def link_skills(root: Path) -> list[str]:
+    """Symlink skills/<name> into every harness skill directory and AGENTS.md under names read by
+    claude, codex, and opencode. Remove dangling symlinks to deleted skills."""
+    changed: list[str] = []
+    skills = sorted(d.name for d in (root / "skills").iterdir() if d.is_dir() and (d / "SKILL.md").exists()) if (root / "skills").is_dir() else []
+    for sd in SKILL_DIRS:
+        depth = len(Path(sd).parts)
+        for name in skills:
+            if relink(root / sd / name, "../" * depth + f"skills/{name}"):
+                changed.append(f"{sd}/{name}")
+        d = root / sd
+        if d.is_dir():
+            for p in d.iterdir():
+                if p.is_symlink() and not p.exists():
+                    p.unlink()
+                    changed.append(f"removed {sd}/{p.name}")
+    if (root / "AGENTS.md").exists():
+        for link, target in RULE_LINKS.items():
+            if relink(root / link, target):
+                changed.append(link)
+    return changed
+
+
+def cmd_link(a) -> None:
+    root = team_dir(find_ad())
+    changed = link_skills(root)
+    print("\n".join(changed) if changed else "all links are in place")
+
+
+def copy_tree_missing(src: Path, dst: Path, mapping: dict, rename: dict | None = None) -> list[str]:
+    """Copy template files not yet present in dst, substituting {{PLACEHOLDERS}}. rename renames
+    top-level names (for example gitignore -> .gitignore). Return created paths relative to dst."""
+    created = []
+    for f in sorted(p for p in src.rglob("*") if p.is_file()):
+        rel = f.relative_to(src)
+        if rename and str(rel) in rename:
+            rel = Path(rename[str(rel)])
+        target = dst / rel
+        if target.exists():
+            continue
+        atomic_write(target, substitute(f.read_text(encoding="utf-8"), mapping))
+        os.chmod(target, 0o644)   # templates are not secrets; atomic_write creates files with mode 0600
+        created.append(str(rel))
+    return created
+
+
+def git_ok(repo: Path, *args: str, timeout: int = 60) -> tuple[bool, str]:
+    rc, so, se = run_bin(["git", "-C", str(repo), *args], timeout=timeout)
+    return rc == 0, (so + se).strip()
+
+
+def add_submodule(root: Path, url: str, path: str) -> str:
+    """Register path as a root submodule. If path is already a clone, git adds it as-is without cloning.
+    protocol.file.allow is needed for URL paths (a local artel clone, agents without a remote)."""
+    ok, out = git_ok(root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", url, path)
+    if ok:
+        return f"submodule {path} <- {url}"
+    if "already exists in the index" in out:
+        return f"submodule {path} already registered"
+    return f"ERROR submodule {path}: {out[-300:]}"
+
+
+# ── update project skills from templates ──
+
+def sha256_text(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def skills_origin_path(root: Path) -> Path:
+    return root / "skills" / ".artel-origin.json"
+
+
+def skills_origin_read(root: Path) -> dict:
+    try:
+        d = json.loads(skills_origin_path(root).read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def skills_record_origin(root: Path, rels: list[str]) -> None:
+    """Record the hash of an installed skill copy: `artel skills` uses it to distinguish untouched from edited copies."""
+    if not rels:
+        return
+    origin = skills_origin_read(root)
+    for rel in rels:
+        p = root / "skills" / rel
+        if p.is_file():
+            origin[str(rel)] = sha256_text(p.read_text(encoding="utf-8"))
+    atomic_write(skills_origin_path(root), json.dumps(origin, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+    os.chmod(skills_origin_path(root), 0o644)
+
+
+def skill_matches_template(tpl_text: str, cur_text: str, mapping: dict) -> bool:
+    """Whether a project copy matches a template after substitution; the template's {{DATE}} accepts any date."""
+    t = substitute(tpl_text, {k: v for k, v in mapping.items() if k != "DATE"})
+    pat = r"\d{4}-\d{2}-\d{2}".join(re.escape(part) for part in t.split("{{DATE}}"))
+    return re.fullmatch(pat, cur_text, re.S) is not None
+
+
+def template_versions(sh: Path, rel: str) -> list[str]:
+    """All versions of a template file: the working copy and each version in the artel repository history."""
+    out = []
+    p = sh / rel
+    if p.is_file():
+        out.append(p.read_text(encoding="utf-8"))
+    rc, so, _ = run_bin(["git", "-C", str(sh), "log", "--format=%H", "--", rel], timeout=30)
+    for h in so.split() if rc == 0 else []:
+        rc2, txt, _ = run_bin(["git", "-C", str(sh), "show", f"{h}:{rel}"], timeout=30)
+        if rc2 == 0:
+            out.append(txt)
+    return out
+
+
+def cmd_skills(a) -> None:
+    """Compare the user project's skills/ with artel/templates/skills. A copy nobody edited (hash from
+    .artel-origin.json or a match with any template version in artel history) is updated to the current template;
+    a copy edited by the super agent is left alone, and the template differences are shown."""
+    ad = find_ad()
+    _, s = load_cfg(ad)
+    root = team_dir(ad)
+    sh = artel_home()
+    tpl = sh / "templates" / "skills"
+    mapping = {"PROJECT": project_name(ad, s), "PROJECT_DIR": str(root), "ARTEL_HOME": str(sh), "DATE": now().strftime("%Y-%m-%d")}
+    origin = skills_origin_read(root)
+    report: list[str] = []
+    to_write: dict[str, str] = {}
+    kept_modified: list[str] = []
+    for f in sorted(p for p in tpl.rglob("*") if p.is_file()):
+        rel = str(f.relative_to(tpl))
+        new_text = substitute(f.read_text(encoding="utf-8"), mapping)
+        target = root / "skills" / rel
+        if not target.exists():
+            report.append(f"- {rel}: missing from project; will be created")
+            to_write[rel] = new_text
+            continue
+        cur = target.read_text(encoding="utf-8")
+        if cur == new_text:
+            origin.setdefault(rel, sha256_text(cur))
+            continue
+        untouched = origin.get(rel) == sha256_text(cur) or any(
+            skill_matches_template(v, cur, mapping) for v in template_versions(sh, f"templates/skills/{rel}"))
+        if untouched:
+            report.append(f"- {rel}: untouched copy of an old template; will be updated")
+            to_write[rel] = new_text
+        else:
+            kept_modified.append(rel)
+            report.append(f"- {rel}: edited in project; leaving it alone; compare: diff {sh / 'templates/skills' / rel} {target}")
+    own: list[str] = []
+    to_remove: list[str] = []
+    for p in sorted((root / "skills").rglob("SKILL.md")) if (root / "skills").is_dir() else []:
+        rel = str(p.relative_to(root / "skills"))
+        if (tpl / rel).exists():
+            continue
+        cur = p.read_text(encoding="utf-8")
+        stale = origin.get(rel) == sha256_text(cur) or any(
+            skill_matches_template(v, cur, mapping) for v in template_versions(sh, f"templates/skills/{rel}"))
+        if stale:
+            to_remove.append(rel)
+            report.append(f"- {rel}: untouched copy of a skill no longer in templates; will be removed")
+        else:
+            own.append(rel)
+    print(f"# artel skills · project {mapping['PROJECT']} · templates {sh} ({artel_commit(sh)})")
+    print("\n".join(report) if report else "- all template skills are up to date")
+    if own:
+        print(f"- project-owned skills (not in templates; leaving alone): {', '.join(own)}")
+    if not a.apply:
+        if to_write or to_remove:
+            print(f"\n(dry run; --apply will update {len(to_write)}, remove {len(to_remove)}, and save previous versions in agents/history/)")
+        return
+    for rel in to_remove:
+        target = root / "skills" / rel
+        dest = ad / "history" / f"skills__{rel.replace('/', '__')}.{stamp()}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, dest)
+        shutil.rmtree(target.parent) if target.parent != root / "skills" else target.unlink()
+        origin.pop(rel, None)
+    for rel, text in to_write.items():
+        target = root / "skills" / rel
+        if target.exists():
+            dest = ad / "history" / f"skills__{rel.replace('/', '__')}.{stamp()}"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, dest)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(target, text)
+        os.chmod(target, 0o644)
+        origin[rel] = sha256_text(text)
+    atomic_write(skills_origin_path(root), json.dumps(origin, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+    os.chmod(skills_origin_path(root), 0o644)
+    links = link_skills(root)
+    if to_write or to_remove or links:
+        journal_write(ad, agent_name(a), "skills-update", f"skills compared with artel templates ({artel_commit(sh)}): updated "
+                      + (", ".join(sorted(to_write)) or "none") + (f"; removed: {', '.join(to_remove)}" if to_remove else "")
+                      + (f"; edited copies left alone: {', '.join(kept_modified)}" if kept_modified else ""))
+    print(f"\nupdated: {len(to_write)}" + (f", removed: {len(to_remove)}" if to_remove else "") + (f", links: {len(links)}" if links else "")
+          + (f"; edited copies left in project: {', '.join(kept_modified)}" if kept_modified else ""))
+
+
+def artel_commit(sh: Path) -> str:
+    rc, so, _ = run_bin(["git", "-C", str(sh), "rev-parse", "--short", "HEAD"], timeout=15)
+    return so.strip() if rc == 0 and so.strip() else "unknown commit"
+
+
+# ── prompt library ──
+
+def frontmatter(text: str) -> dict:
+    """Header between the first `---` lines: flat `key: value` pairs, lists in square brackets separated by commas.
+    Parsed manually because module descriptions contain colons, which break YAML."""
+    m = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    if not m:
+        return {}
+    out: dict = {}
+    for line in m.group(1).splitlines():
+        km = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", line)
+        if not km:
+            continue
+        key, val = km.group(1), km.group(2).strip()
+        if val.startswith("[") and val.endswith("]"):
+            out[key] = [v.strip().strip("'\"") for v in val[1:-1].split(",") if v.strip()]
+        else:
+            out[key] = val.strip("'\"")
+    return out
+
+
+def prompt_modules(ad: Path) -> dict[str, Path]:
+    """Module name → file: the artel/templates/prompts/<group>/<name>.md library and project agents/prompts/<name>.md
+    (named `project/<name>`)."""
+    out: dict[str, Path] = {}
+    lib = artel_home() / "templates" / "prompts"
+    for f in sorted(lib.rglob("*.md")) if lib.is_dir() else []:
+        out[str(f.relative_to(lib).with_suffix(""))] = f
+    proj = ad / "prompts"
+    for f in sorted(proj.glob("*.md")) if proj.is_dir() else []:
+        out[f"project/{f.stem}"] = f
+    return out
+
+
+def identity_files(ad: Path) -> list[Path]:
+    return sorted(p for p in ad.glob("agent-*.md") if p.is_file())
+
+
+def cmd_prompts(a) -> None:
+    """Prompt library catalog (descriptions from frontmatter), module text, and identity provenance status:
+    which of their sources changed in artel after compilation."""
+    ad = find_ad()
+    sh = artel_home()
+    mods = prompt_modules(ad)
+    if a.sub == "show":
+        if not a.name:
+            die("specify a module: artel prompts show artel/worker")
+        name = a.name[:-3] if a.name.endswith(".md") else a.name
+        if name not in mods:
+            die(f"module {name} not found; catalog: artel prompts")
+        sys.stdout.write(mods[name].read_text(encoding="utf-8"))
+        return
+    if a.sub == "list":
+        print(f"# prompt library · {sh / 'templates' / 'prompts'} ({artel_commit(sh)}) · project prompts in {ad / 'prompts'}")
+        group = None
+        for name, f in mods.items():
+            g = name.split("/", 1)[0]
+            if g != group:
+                group = g
+                print(f"\n## {g}/")
+            fm = frontmatter(f.read_text(encoding="utf-8"))
+            req = fm.get("requires") or []
+            req_s = f"  (requires: {', '.join(map(str, req))})" if req else ""
+            print(f"- **{name}**: {fm.get('description', '(no description)')}{req_s}")
+        print("\ntext: artel prompts show <module> · identity provenance: artel prompts status")
+        return
+    # status
+    head = artel_commit(sh)
+    ids = identity_files(ad)
+    if not ids:
+        print("no identities in agents/agent-*.md")
+        return
+    print(f"# artel prompts status · artel {head}")
+    for p in ids:
+        fm = frontmatter(p.read_text(encoding="utf-8"))
+        agent = p.name[len("agent-"):-3]
+        sources = fm.get("sources") or []
+        base = str(fm.get("artel") or "").strip()
+        if not sources or not base:
+            print(f"- {agent}: no provenance (frontmatter sources/artel); whether compiled from the library is unknown")
+            continue
+        rc, _, _ = run_bin(["git", "-C", str(sh), "cat-file", "-e", f"{base}^{{commit}}"], timeout=15)
+        if rc != 0:
+            print(f"- {agent}: artel commit {base} from frontmatter not found in history; check modules manually")
+            continue
+        changed, missing = [], []
+        for name in map(str, sources):
+            f = mods.get(name)
+            if f is None:
+                missing.append(name)
+                continue
+            if name.startswith("project/"):
+                comp = str(fm.get("compiled") or "")
+                if comp and dt.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d") > comp:
+                    changed.append(name)
+                continue
+            rel = str(f.relative_to(sh))
+            rc, so, _ = run_bin(["git", "-C", str(sh), "diff", "--quiet", base, "HEAD", "--", rel], timeout=15)
+            if rc == 1:
+                changed.append(name)
+        if not changed and not missing:
+            print(f"- {agent}: sources unchanged since {base} ({fm.get('compiled', 'compile date not specified')})")
+        else:
+            parts = []
+            if changed:
+                parts.append("changed: " + ", ".join(changed) + f" (git -C {sh} diff {base} HEAD -- templates/prompts/<module>.md)")
+            if missing:
+                parts.append("missing modules: " + ", ".join(missing))
+            print(f"- {agent}: compiled at {base}; " + "; ".join(parts))
+
+
+def cmd_init(a) -> None:
+    """Lay out the user project root (usually /home/artel): a git repository with artel and agents submodules,
+    skills/ symlinked into every harness, AGENTS.md, and goal.md. A repeated run overwrites nothing."""
+    root = Path(a.home).expanduser().resolve() if a.home else Path.cwd().resolve()
+    project = a.project or root.name
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{1,40}", project):
+        die("project name: lowercase Latin letters, digits, and hyphens, for example my-site")
+    sh = artel_home()
+    if sh.parent != root and not a.force:
+        die(f"artel command is in {sh}, but project root is {root}: the artel repository must be the {root / 'artel'} submodule\n"
+            f"(clone it there and run {root / 'artel/bin/artel'} init; or use --force if this is intentional)", EXIT_CFG)
+    tpl = sh / "templates"
+    mapping = {"PROJECT": project, "PROJECT_DIR": str(root), "ARTEL_HOME": str(sh),
+               "DATE": now().strftime("%Y-%m-%d"), "GOAL_SUMMARY": "(filled in by the installer with the user)"}
+    log: list[str] = []
+
+    if git_toplevel(root) != root:
+        ok, out = git_ok(root, "init", "-q", "-b", "main")
+        log.append("git init root" if ok else f"ERROR git init: {out}")
+    log += [f"created {p}" for p in copy_tree_missing(tpl / "home", root, mapping, rename={"gitignore": ".gitignore"})]
+    for d in ("src", "scratch"):
+        (root / d).mkdir(exist_ok=True)
+
+    ad = root / "agents"
+    log += [f"created agents/{p}" for p in copy_tree_missing(tpl / "agents", ad, mapping)]
+    if git_toplevel(ad) != ad:
+        ok, out = git_ok(ad, "init", "-q", "-b", "main")
+        log.append("git init agents/" if ok else f"ERROR git init agents/: {out}")
+        res = git_commit_paths(ad, ["."], f"artel: lay out agents/ for {project}")
+        log.append(f"agents/ commit: {res}")
+    created_skills = copy_tree_missing(tpl / "skills", root / "skills", mapping)
+    log += [f"created skills/{p}" for p in created_skills]
+    skills_record_origin(root, created_skills)
+    log += [f"link {p}" for p in link_skills(root)]
+
+    # submodules: artel (source for updates), agents (local, no remote), repositories in src/
+    artel_url = a.artel_url
+    if not artel_url:
+        ok, out = git_ok(sh, "remote", "get-url", "origin")
+        artel_url = out if ok and out else "./artel"
+    log.append(add_submodule(root, artel_url, "artel"))
+    log.append(add_submodule(root, "./agents", "agents"))
+    for src_url in a.src or []:
+        name = re.sub(r"\.git$", "", src_url.rstrip("/").rsplit("/", 1)[-1])
+        log.append(add_submodule(root, src_url, f"src/{name}"))
+    for d in sorted(p for p in (root / "src").iterdir() if p.is_dir()) if (root / "src").is_dir() else []:
+        if git_toplevel(d) == d.resolve():
+            ok, url = git_ok(d, "remote", "get-url", "origin")
+            log.append(add_submodule(root, url if ok and url else f"./src/{d.name}", f"src/{d.name}"))
+    for d in sorted(p for p in (root / "src").iterdir() if p.is_dir()) if (root / "src").is_dir() else []:
+        if git_toplevel(d) != d.resolve():
+            log.append(f"src/{d.name}: not a git repository; not included in root history (submodules only); this is normal for data directories")
+    res = git_commit_paths(root, [*ROOT_TRACKED, *submodule_paths(root)], f"artel: lay out user project {project}")
+    log.append(f"root commit: {res}")
+    path_lines = ensure_shell_path(root, sh)
+    log += path_lines
+
+    print("\n".join(log))
+    if any(line.startswith("ERROR") for line in log):
+        sys.exit(EXIT_ERR)
+    path_hint = ("" if shutil.which("artel") else
+                 "  artel command not in PATH yet: open a new shell (PATH line added to ~/.profile and ~/.bashrc)\n" if path_lines else
+                 f"  artel command not in PATH: export PATH={sh / 'bin'}:$PATH\n")
+    print(f"\nDone: {root}\n  goal.md       project goal (written by the user with the installer)\n  agents/       plans, journal, config, prompts (its own git)\n"
+          f"  skills/       super skill (/super), linked into every harness (artel link updates links)\n  artel/        artel system (submodule, update: git -C artel pull); prompt library templates/prompts (artel prompts)\n"
+          f"  src/          project repositories (submodules or mounts)\n" + path_hint)
+
+
+def ensure_shell_path(root: Path, sh: Path) -> list[str]:
+    """Interactive shells in the container must find `artel`. The artel-base image sets PATH in /etc/profile.d;
+    a container the user prepared themselves (installation from inside) gets the line in ~/.profile and ~/.bashrc.
+    Only when the user project is the home directory and `artel` is not already resolvable."""
+    if shutil.which("artel") or root != Path.home():
+        return []
+    bin_dir = str(sh / "bin").replace(str(root), "$HOME", 1)
+    line = f'export PATH="{bin_dir}:$PATH"  # artel'
+    out: list[str] = []
+    for rc in (".profile", ".bashrc"):
+        f = root / rc
+        text = f.read_text(encoding="utf-8", errors="replace") if f.exists() else ""
+        if bin_dir in text or "profile.d/artel.sh" in text:
+            continue
+        f.write_text(text + ("" if not text or text.endswith("\n") else "\n") + line + "\n", encoding="utf-8")
+        out.append(f"PATH line added to ~/{rc}")
+    return out
+
+
+def cmd_cheatsheet(a) -> None:
+    """One screen, no blank lines: how to manage the project container from the host and from inside. Printed by
+    install/artel-up.sh after the container is up and shown by the installer at the end of the installation."""
+    project, root = a.project, None
+    if not project:
+        try:
+            ad = find_ad()
+            _, s = load_cfg(ad)
+            project, root = project_name(ad, s), ad.parent
+        except SystemExit:
+            die("not inside a user project: pass --project <name>", EXIT_CFG)
+    c = a.container or f"artel-{project}"
+    user = a.user or getpass.getuser()
+    home = f"/home/{user}" if a.user or root is None else str(root)
+    enter = f"incus exec {c} -- sudo -iu {user}"
+    rows = [
+        ("enter", enter, "shell inside (append a command to run it)"),
+        ("status", "artel env · artel quota · cat agents/planning/STATE.md", "environment, quotas, position"),
+        ("schedule", "artel schedule · systemctl --user list-timers 'artel-*'", "slots, agents, next runs"),
+        ("talk", "claude, then /super [message]", "live session with the super agent"),
+        ("run now", "artel run super · artel run <agent> [--task <t>]", "outside the schedule; --dry-run"),
+        ("logs", f"journalctl --user -u '{c}-*' -f · agents/state/logs/", "units; one file per run"),
+        ("journal", "tail -40 agents/journal.md · artel journal \"<text>\"", "decisions and events"),
+        ("pause", f"systemctl --user stop '{c}-*.timer'", "resume: artel register --apply"),
+        ("stop all", "artel unregister", "back: artel register --apply"),
+        ("goal", "edit goal.md, then /super \"goal.md changed\"", "or a message in the channel"),
+        ("update", "git -C ~/artel pull && artel skills --apply", "then artel prompts status"),
+        ("snapshot", f"incus snapshot create|restore|list {c} [<name>]", "rollback point"),
+        ("container", f"incus stop|start {c} · incus delete -f {c}", "the project lives inside"),
+        ("logins", f"install/auth-transfer.sh {c} --check", "per harness, from the host clone"),
+    ]
+    print(f"{c} · user {user} · project {home} · incus commands on the host, the rest inside")
+    w1 = max(len(r[0]) for r in rows)
+    w2 = max(len(r[1]) for r in rows)
+    for k, cmd, note in rows:
+        print(f"{k:<{w1}}  {cmd:<{w2}}  {note}")
+
+
+# ───────────────────────── telegram ─────────────────────────
+
+def tg_creds(s: dict):
+    token = os.environ.get("ARTEL_TG_TOKEN")
+    chat = os.environ.get("ARTEL_TG_CHAT_ID")
+    envf = cget(s, "channel.telegram.env_file")
+    if (not token or not chat) and envf:
+        p = expand(envf)
+        if p.exists():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.strip().strip('"').strip("'")
+                if k.strip() == "ARTEL_TG_TOKEN" and not token:
+                    token = v
+                if k.strip() == "ARTEL_TG_CHAT_ID" and not chat:
+                    chat = v
+    return token, chat
+
+
+def tg_api(token: str, method: str, data: dict | None = None, timeout: int = 35):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    body = urllib.parse.urlencode(data or {}).encode()
+    req = urllib.request.Request(url, data=body)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        res = json.loads(r.read().decode("utf-8"))
+    if not res.get("ok"):
+        raise RuntimeError(res.get("description", "telegram error"))
+    return res["result"]
+
+
+def html_escape(t: str) -> str:
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def tg_send(token: str, chat: str, text: str, silent: bool = False) -> int:
+    chunks, cur = [], ""
+    for line in text.splitlines(keepends=True):
+        if len(cur) + len(line) > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += line
+    if cur:
+        chunks.append(cur)
+    msg_id = 0
+    for c in chunks:
+        res = tg_api(token, "sendMessage", {
+            "chat_id": chat, "text": c, "parse_mode": "HTML",
+            "disable_notification": "true" if silent else "false",
+        })
+        msg_id = int(res["message_id"])
+    return msg_id
+
+
+def tg_wait_reply(token: str, chat: str, msg_id: int, tag: str, sent_ts: float,
+                  deadline: float, strict: bool) -> str | None:
+    """Wait for a chat reply. Acknowledge (offset) only its own updates so others are not consumed."""
+    offset = None
+    while time.time() < deadline:
+        try:
+            params = {"timeout": 20}
+            if offset is not None:
+                params["offset"] = offset
+            updates = tg_api(token, "getUpdates", params, timeout=45)
+        except Exception as e:  # noqa: BLE001
+            print(f"artel: telegram getUpdates: {e}", file=sys.stderr)
+            time.sleep(5)
+            continue
+        for u in updates:
+            m = u.get("message")
+            if not m or str(m.get("chat", {}).get("id")) != str(chat):
+                continue
+            is_reply = (m.get("reply_to_message") or {}).get("message_id") == msg_id
+            text = (m.get("text") or m.get("caption") or "")
+            has_tag = tag in text
+            after = float(m.get("date", 0)) >= sent_ts - 5
+            if is_reply or has_tag or (not strict and after):
+                offset = int(u["update_id"]) + 1
+                try:
+                    tg_api(token, "getUpdates", {"offset": offset, "timeout": 0}, timeout=15)
+                except Exception:  # noqa: BLE001
+                    pass
+                return text.replace(tag, "").strip()
+        time.sleep(2)
+    return None
+
+
+# ───────────────────────── file channel ─────────────────────────
+
+def chan_dirs(ad: Path):
+    base = ad / "channel"
+    return base, base / "inbox", base / "outbox", base / "archive"
+
+
+def concierge_alive(ad: Path, s: dict) -> bool:
+    f = ad / "channel" / "concierge.alive"
+    return f.exists() and (time.time() - f.stat().st_mtime) < ALIVE_TTL_SEC
+
+
+def new_id() -> str:
+    return now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+
+
+def compose_body(project: str, agent: str, title: str, text: str, options: str | None,
+                 deadline: dt.datetime | None, default: str | None) -> str:
+    parts = [f"<b>{html_escape(title)}</b>", f"project {html_escape(project)} · agent {html_escape(agent)}", "", html_escape(text)]
+    if options:
+        parts += ["", "Options: " + html_escape(options)]
+    if deadline is not None:
+        parts += ["", f"Waiting for a reply until {deadline.strftime('%H:%M')}." + (f" If there is no reply: {html_escape(default)}" if default else "")]
+    return "\n".join(parts)
+
+
+def strip_html(t: str) -> str:
+    return re.sub(r"</?b>", "", t).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def route(ad: Path, s: dict, via: str | None, kind: str) -> str:
+    via = (via or "auto").lower()
+    token, chat = tg_creds(s)
+    tg_ok = bool(token and chat)
+    dedicated = bool(cget(s, "channel.telegram.dedicated_bot", False))
+    alive = concierge_alive(ad, s)
+    if via == "claude":
+        return "claude"
+    if via == "telegram":
+        if not tg_ok:
+            die("telegram is not configured: ARTEL_TG_TOKEN and ARTEL_TG_CHAT_ID are required (see channel.telegram.env_file)", EXIT_CFG)
+        if kind == "request" and not dedicated:
+            die("ask via telegram requires channel.telegram.dedicated_bot: true (the bot's getUpdates are read only by artel)", EXIT_CFG)
+        return "telegram"
+    if via != "auto":
+        die(f"unknown channel {via!r}; allowed: auto | claude | telegram", EXIT_CFG)
+    if alive:
+        return "claude"
+    if tg_ok and (kind == "message" or dedicated):
+        return "telegram"
+    if kind == "message":
+        return "claude"  # goes into inbox; concierge delivers it when it wakes up
+    die("no channel for the question: concierge is not answering, and telegram is not configured or dedicated", EXIT_CFG)
+    raise SystemExit
+
+
+# ───────────────────────── commands: messages ─────────────────────────
+
+def send_user_message(ad: Path, s: dict, agent: str, title: str, text: str, urgent: bool = False,
+                      via: str | None = None) -> str:
+    """Message the user through the channel selected by route(): the concierge inbox or telegram. Return a status string."""
+    project = project_name(ad, s)
+    quiet = in_quiet_hours(s) and not urgent
+    ch = route(ad, s, via, "message")
+    rid = new_id()
+    body = compose_body(project, agent, title, text, None, None, None)
+    if ch == "claude":
+        _, inbox, _, _ = chan_dirs(ad)
+        meta = {"id": rid, "type": "message", "agent": agent, "project": project, "created": iso(),
+                "urgent": str(bool(urgent)).lower(), "title": title}
+        atomic_write(inbox / f"{rid}.md", render_front(meta, strip_html(body)))
+        state = "concierge session alive" if concierge_alive(ad, s) else "concierge not answering; will deliver later"
+        status = f"{rid}: queued on the claude channel ({state})"
+    else:
+        token, chat = tg_creds(s)
+        tg_send(token, chat, body, silent=quiet)
+        status = f"{rid}: sent to telegram" + (" (quiet, quiet hours)" if quiet else "")
+    journal_write(ad, agent, "user-message", f"{rid} · {title} · channel {ch}")
+    return status
+
+
+def cmd_notify(a) -> None:
+    ad = find_ad()
+    _, s = load_cfg(ad)
+    print(send_user_message(ad, s, agent_name(a), a.title or "Message from agent", read_text_arg(a.text), bool(a.urgent), a.via))
+
+
+AUTH_ALERT_COOLDOWN_SEC = 12 * 3600
+AUTH_FIX_HINT = {
+    "claude": "on the host, run `claude setup-token`; put token sk-ant-oat01-… in claude.oauth_token in auth.json, then "
+              "run `install/auth-transfer.sh <container> --auth-file <auth.json>`. The copied host session is not valid in the container.",
+    "codex": "`incus exec <container> -- sudo -iu artel codex login --device-auth` (subscription login expires; "
+             "see docs/harness-auth-guide.md) or api_key in auth.json.",
+    "agy": "`incus exec <container> -- sudo -iu artel env SSH_CONNECTION=1 agy` or gemini_api_key in auth.json.",
+    "opencode": "`incus exec <container> -- sudo -iu artel opencode auth login` or provider keys in auth.json.",
+}
+
+
+def alert_user_once(ad: Path, s: dict, agent: str, key: str, title: str, text: str, kind: str,
+                    cooldown: int = AUTH_ALERT_COOLDOWN_SEC) -> bool:
+    """Message the user at most once per cooldown per key (stamp in agents/state/alert-<key>.ts). Return whether it was sent."""
+    stamp = state_dir(ad) / f"alert-{key}.ts"
+    try:
+        if stamp.exists() and time.time() - stamp.stat().st_mtime < cooldown:
+            journal_write(ad, agent, kind, f"{title} (repeat; user was already notified)")
+            return False
+    except OSError:
+        pass
+    try:
+        status = send_user_message(ad, s, agent, title, text, urgent=True)
+        atomic_write(stamp, iso())
+        journal_write(ad, agent, kind, f"sent to user: {title} · {status}")
+        return True
+    except SystemExit:
+        journal_write(ad, agent, kind, f"{title}, but the user channel is not configured")
+    except Exception as e:  # noqa: BLE001
+        journal_write(ad, agent, kind, f"{title}; could not notify user: {e}")
+    return False
+
+
+def alert_auth_failure(ad: Path, s: dict, agent: str, harness: str, logfile: Path, log_text: str) -> None:
+    """A run failed while logging into the harness: tell the user immediately, at most once per harness per
+    AUTH_ALERT_COOLDOWN_SEC. Otherwise an expired login appears only in the journal while the user waits for a report that never arrives."""
+    reason = ""
+    for ln in log_text.splitlines():
+        if looks_like_auth_problem(ln) and not ln.startswith("#"):
+            reason = strip_html(ln).strip()[:200]
+            break
+    text = (f"Agent {agent} run failed: harness {harness} is not logged in or the login has expired.\n"
+            f"Error: {reason or 'see log'}\n"
+            f"All agents on {harness} will fail until the login is fixed. Fix: {AUTH_FIX_HINT.get(harness, 'see docs/harness-auth-guide.md')}\n"
+            f"Check after fixing: install/auth-transfer.sh <container> --check. Log: {logfile}")
+    alert_user_once(ad, s, agent, f"auth-{harness}", f"{harness} login is not working", text, "auth-alert")
+
+
+FAILURE_STREAK_PAUSE = 3
+
+
+def failures_file(ad: Path) -> Path:
+    return state_dir(ad) / "failures.json"
+
+
+def failures_read(ad: Path) -> dict:
+    try:
+        d = json.loads(failures_file(ad).read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def failures_update(ad: Path, agent: str, ok: bool) -> int:
+    """Count consecutive failed runs; success resets the count. Return the new value."""
+    d = failures_read(ad)
+    n = 0 if ok else int(d.get(agent, 0) or 0) + 1
+    d[agent] = n
+    atomic_write(failures_file(ad), json.dumps(d, ensure_ascii=False, indent=1))
+    return n
+
+
+def alert_run_failure(ad: Path, s: dict, agent: str, a_def: dict, harness: str, outcome: str, detail: str,
+                      logfile: Path, streak: int) -> None:
+    """Super agent: every failure (error/killed) is sent to the user; otherwise it is visible only in the journal.
+    Worker: after FAILURE_STREAK_PAUSE consecutive failures, notify the user and skip timer runs
+    until the count is reset (`artel run <agent> --force` or success)."""
+    is_super = agent == "super" or bool(a_def.get("alert_failures"))
+    if is_super:
+        text = (f"Agent {agent} ({harness}) run ended with outcome {outcome}: {detail}.\n"
+                f"This run's report will not arrive. Log: {logfile}\n"
+                f"Inspect: journalctl --user -u {unit_base(project_name(ad, s), agent)} ; restart: artel run {agent}")
+        alert_user_once(ad, s, agent, f"fail-{agent}", f"Agent {agent} failed ({outcome})", text, "run-alert")
+    elif streak == FAILURE_STREAK_PAUSE:
+        text = (f"Agent {agent} ({harness}) failed {streak} times in a row; last outcome {outcome}: {detail}.\n"
+                f"Its timer runs are paused pending intervention: super will handle it in its next iteration, "
+                f"or run `artel run {agent} --force` manually (runs it and resets the count). Log: {logfile}")
+        alert_user_once(ad, s, agent, f"streak-{agent}", f"Agent {agent}: {streak} consecutive failures; runs paused",
+                        text, "run-alert", cooldown=0)
+        journal_write(ad, agent, "paused", f"{streak} consecutive failed runs; timer runs paused until artel run {agent} --force")
+
+
+def cmd_ask(a) -> None:
+    ad = find_ad()
+    _, s = load_cfg(ad)
+    agent = agent_name(a)
+    text = read_text_arg(a.text)
+    title = a.title or "Question from agent"
+    project = project_name(ad, s)
+    if in_quiet_hours(s) and not a.urgent:
+        print("quiet hours: question not asked; follow the \"no reply\" scenario", file=sys.stderr)
+        sys.exit(EXIT_QUIET)
+    timeout = parse_duration(a.timeout) if a.timeout else DEFAULT_ASK_TIMEOUT
+    deadline = now() + dt.timedelta(seconds=timeout)
+    ch = route(ad, s, a.via, "request")
+    rid = new_id()
+    body = compose_body(project, agent, title, text, a.options, deadline, a.default)
+    journal_write(ad, agent, "user-question", f"{rid} · {title} · channel {ch} · until {deadline.strftime('%H:%M')}")
+    if ch == "claude":
+        _, inbox, outbox, _ = chan_dirs(ad)
+        meta = {"id": rid, "type": "request", "agent": agent, "project": project, "created": iso(),
+                "deadline": iso(deadline), "urgent": str(bool(a.urgent)).lower(), "title": title,
+                "options": a.options or "", "default": a.default or ""}
+        atomic_write(inbox / f"{rid}.md", render_front(meta, strip_html(body)))
+        print(f"artel: question {rid} passed to the concierge session; waiting until {deadline.strftime('%H:%M')}", file=sys.stderr)
+        out = outbox / f"{rid}.md"
+        while now() < deadline:
+            if out.exists():
+                meta2, answer = parse_front(out.read_text(encoding="utf-8"))
+                status = meta2.get("status", "answered")
+                archive_pair(ad, rid)
+                journal_write(ad, agent, "user-answer", f"{rid} · {status}\n{answer.strip()}")
+                print(answer.strip())
+                sys.exit(EXIT_REJECTED if status == "rejected" else EXIT_OK)
+            time.sleep(3)
+        journal_write(ad, agent, "user-timeout", f"{rid} · no reply by {deadline.strftime('%H:%M')}; concierge will record a late reply")
+        print("artel: no reply (timeout)", file=sys.stderr)
+        sys.exit(EXIT_TIMEOUT)
+    token, chat = tg_creds(s)
+    tag = f"#q{rid[-4:]}"
+    msg_id = tg_send(token, chat, body + f"\n\nReply to this message or include the {tag} tag.", silent=False)
+    sent = time.time()
+    answer = tg_wait_reply(token, chat, msg_id, tag, sent, sent + timeout, strict=not a.any_reply)
+    if answer is None:
+        journal_write(ad, agent, "user-timeout", f"{rid} · telegram, no reply")
+        print("artel: no reply (timeout)", file=sys.stderr)
+        sys.exit(EXIT_TIMEOUT)
+    journal_write(ad, agent, "user-answer", f"{rid} · telegram\n{answer}")
+    print(answer)
+
+
+def archive_pair(ad: Path, rid: str) -> None:
+    _, inbox, outbox, archive = chan_dirs(ad)
+    dest = archive / rid
+    dest.mkdir(parents=True, exist_ok=True)
+    for src, name in ((inbox / f"{rid}.md", "inbox.md"), (outbox / f"{rid}.md", "outbox.md")):
+        if src.exists():
+            os.replace(src, dest / name)
+
+
+def pending_requests(ad: Path):
+    _, inbox, outbox, _ = chan_dirs(ad)
+    inbox.mkdir(parents=True, exist_ok=True)
+    outbox.mkdir(parents=True, exist_ok=True)
+    items = []
+    for f in sorted(inbox.glob("*.md")):
+        if (outbox / f.name).exists():
+            continue
+        meta, _ = parse_front(f.read_text(encoding="utf-8"))
+        items.append((f, meta))
+    return items
+
+
+def cmd_channel(a) -> None:
+    ad = find_ad()
+    _, s = load_cfg(ad)
+    base, inbox, outbox, archive = chan_dirs(ad)
+    for d in (inbox, outbox, archive):
+        d.mkdir(parents=True, exist_ok=True)
+    alive = base / "concierge.alive"
+    if a.sub == "alive":
+        alive.touch()
+        print(iso())
+        return
+    if a.sub == "watch":
+        timeout = parse_duration(a.timeout) if a.timeout else 3600
+        interval = int(a.interval or 5)
+        end = time.time() + timeout
+        while True:
+            alive.touch()
+            items = pending_requests(ad)
+            if items:
+                for f, meta in items:
+                    print(f"{meta.get('type','?'):8} {meta.get('id', f.stem)}  {meta.get('agent','?')}  {meta.get('title','')}  → {f}")
+                return
+            if time.time() >= end:
+                print("artel: no new requests", file=sys.stderr)
+                sys.exit(EXIT_TIMEOUT)
+            time.sleep(interval)
+    if a.sub == "pending":
+        items = pending_requests(ad)
+        if not items:
+            print("no requests")
+        for f, meta in items:
+            dl = meta.get("deadline", "")
+            late = ""
+            if dl:
+                try:
+                    late = " OVERDUE" if dt.datetime.fromisoformat(dl) < now() else ""
+                except ValueError:
+                    pass
+            print(f"{meta.get('type','?'):8} {meta.get('id', f.stem)}  {meta.get('agent','?')}  {meta.get('title','')}  {dl}{late}")
+        return
+    if a.sub == "show":
+        f = inbox / f"{a.id}.md"
+        if not f.exists():
+            f = archive / a.id / "inbox.md"
+        if not f.exists():
+            die(f"request {a.id} not found")
+        print(f.read_text(encoding="utf-8"))
+        o = outbox / f"{a.id}.md"
+        if o.exists():
+            print("=== reply ===")
+            print(o.read_text(encoding="utf-8"))
+        return
+    if a.sub == "reply":
+        f = inbox / f"{a.id}.md"
+        if not f.exists():
+            die(f"request {a.id} not found in inbox")
+        meta, _ = parse_front(f.read_text(encoding="utf-8"))
+        text = read_text_arg(a.text) if (a.text is not None or not sys.stdin.isatty()) and a.status != "delivered" else (a.text or "")
+        out_meta = {"id": a.id, "status": a.status, "at": iso(), "by": a.by or "concierge"}
+        atomic_write(outbox / f"{a.id}.md", render_front(out_meta, text))
+        journal_write(ad, a.by or "concierge", f"channel-{a.status}", f"{a.id} · {meta.get('title','')} · agent {meta.get('agent','?')}" + (f"\n{text}" if text else ""))
+        late = False
+        if meta.get("deadline"):
+            try:
+                late = dt.datetime.fromisoformat(meta["deadline"]) < now()
+            except ValueError:
+                pass
+        if meta.get("type") == "message" or late:
+            archive_pair(ad, a.id)
+            print(f"{a.id}: {a.status}, archived" + (" (late reply; agent is no longer waiting for it; entry is in the journal)" if late else ""))
+        else:
+            print(f"{a.id}: {a.status}, agent will collect the reply")
+        return
+    if a.sub == "archive":
+        archive_pair(ad, a.id)
+        print(f"{a.id}: archived")
+        return
+    die(f"unknown channel subcommand {a.sub}")
+
+
+# ───────────────────────── commands: journal, notes, locks ─────────────────────────
+
+def cmd_journal(a) -> None:
+    ad = find_ad()
+    journal_write(ad, agent_name(a), a.type or "note", read_text_arg(a.text))
+    print("ok")
+
+
+def substitute(text: str, mapping: dict) -> str:
+    """Substitute {{KEY}} from mapping; {{{KEY}}} remains in the text as {{KEY}} (so documentation can
+    show the placeholder itself)."""
+    text = re.sub(r"\{\{\{([A-Z_]+)\}\}\}", lambda m: "\x00" + m.group(1) + "\x00", text)
+    for k, v in mapping.items():
+        text = text.replace("{{" + k + "}}", str(v))
+    return re.sub("\x00([A-Z_]+)\x00", lambda m: "{{" + m.group(1) + "}}", text)
+
+
+def cmd_team(a) -> None:
+    ad = find_ad()
+    _, s = load_cfg(ad)
+    project = project_name(ad, s)
+    if a.sub == "init":
+        if not a.name:
+            die("specify an agent name: artel team init <name>")
+        name = a.name
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,30}", name):
+            die("agent name: Latin letters, digits, hyphens, no spaces; for example builder")
+        tpl = artel_home() / "templates" / "sphere"
+        if not tpl.exists():
+            die(f"templates not found: {tpl}")
+        dest = ad / "team" / name
+        mapping = {"AGENT": name, "PROJECT": project, "DATE": now().strftime("%Y-%m-%d"), "ARTEL_HOME": str(artel_home()),
+                   "ARTEL_COMMIT": artel_commit(artel_home())}
+        created = []
+        for f in sorted(tpl.glob("*.md")):
+            target = dest / f.name
+            if target.exists():
+                continue
+            atomic_write(target, substitute(f.read_text(encoding="utf-8"), mapping))
+            created.append(str(target.relative_to(ad)))
+        prompt = ad / f"agent-{name}.md"
+        prompt_tpl = artel_home() / "templates" / "agent-prompt.md"
+        if name != "super" and not prompt.exists() and prompt_tpl.exists():
+            atomic_write(prompt, substitute(prompt_tpl.read_text(encoding="utf-8"), mapping))
+            created.append(str(prompt.relative_to(ad)))
+        journal_write(ad, agent_name(a), "team-init", f"created agent sphere {name}: " + ", ".join(created))
+        print("\n".join(created) if created else "everything already exists")
+        return
+    if a.sub == "status":
+        since = parse_since(ad, a.since)
+        root = ad / "team"
+        dirs = sorted(d for d in root.iterdir() if d.is_dir() and not d.name.startswith("_")) if root.exists() else []
+        if a.agent:
+            dirs = [d for d in dirs if d.name == a.agent]
+        if not dirs:
+            print("no agent spheres (artel team init <name>)")
+            return
+        for d in dirs:
+            print(f"\n{'=' * 70}\n{d.name}\n{'=' * 70}")
+            state = d / "STATE.md"
+            if state.exists():
+                print(state.read_text(encoding="utf-8").rstrip())
+            summ = d / "SUMMARY.md"
+            if summ.exists():
+                entries = summary_entries(summ.read_text(encoding="utf-8"))
+                fresh = [(ts, body) for ts, body in entries if since is None or (ts and ts >= since)]
+                if fresh:
+                    print(f"\n--- SUMMARY, new entries: {len(fresh)} ---")
+                    for ts, body in fresh:
+                        print(body.rstrip() if a.full else "\n".join(body.rstrip().splitlines()[:6]))
+                        print()
+                else:
+                    print("\n--- SUMMARY: no new entries ---")
+        return
+    die(f"unknown team subcommand {a.sub}")
+
+
+def summary_entries(text: str):
+    """Split SUMMARY.md into entries by `## YYYY-MM-DD HH:MM · …` headings."""
+    parts = re.split(r"(?m)^(?=## \d{4}-\d{2}-\d{2} \d{2}:\d{2})", text)
+    out = []
+    for part in parts:
+        m = re.match(r"## (\d{4}-\d{2}-\d{2} \d{2}:\d{2})", part)
+        if not m:
+            continue
+        ts = dt.datetime.strptime(m[1], "%Y-%m-%d %H:%M").astimezone()
+        out.append((ts, part))
+    return out
+
+
+def cmd_summary(a) -> None:
+    ad = find_ad()
+    agent = agent_name(a)
+    if a.sub != "add":
+        die("subcommand: artel summary add …")
+    text = read_text_arg(a.text)
+    run = a.run or os.environ.get("ARTEL_RUN") or now().strftime("%Y-%m-%d_%H-%M")
+    path = ad / "team" / agent / "SUMMARY.md"
+    if not path.exists():
+        die(f"{path} not found: run artel team init {agent} first", EXIT_CFG)
+    append_text(path, f"\n## {human()} · run {run} · {a.status}\n{text}\n")
+    print(f"{path.relative_to(ad)}: entry added ({a.status})")
+
+
+def parse_since(ad: Path, spec: str | None) -> dt.datetime | None:
+    if not spec:
+        return None
+    if spec.startswith("mark:"):
+        marks = load_marks(ad)
+        v = marks.get(spec[5:])
+        return dt.datetime.fromisoformat(v) if v else None
+    if re.fullmatch(r"\d+[smhd]?", spec):
+        return now() - dt.timedelta(seconds=parse_duration(spec))
+    return dt.datetime.fromisoformat(spec).astimezone()
+
+
+def cmd_lock(a) -> None:
+    ad = find_ad()
+    lock = ad / ".lock" / f"{a.name}.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    ttl, wait = int(a.ttl), int(a.wait)
+    end = time.time() + wait
+    while True:
+        try:
+            lock.mkdir()
+            (lock / "owner").write_text(f"pid {os.getpid()} · {agent_name(a)} · {iso()}\n", encoding="utf-8")
+            break
+        except FileExistsError:
+            age = time.time() - lock.stat().st_mtime
+            if age > ttl:
+                shutil.rmtree(lock, ignore_errors=True)
+                continue
+            if time.time() >= end:
+                die(f"lock {a.name} is held ({(lock / 'owner').read_text(encoding='utf-8').strip() if (lock / 'owner').exists() else '?'})", EXIT_TIMEOUT)
+            time.sleep(1)
+    try:
+        if not a.cmd:
+            die("after the lock name, specify a command: artel lock plan -- <command>")
+        cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+        rc = subprocess.call(cmd)
+    finally:
+        shutil.rmtree(lock, ignore_errors=True)
+    sys.exit(rc)
+
+
+def cmd_escalate(a) -> None:
+    ad = find_ad()
+    agent = agent_name(a)
+    text = read_text_arg(a.text)
+    path = ad / "escalations" / f"{stamp()}-{agent}.md"
+    atomic_write(path, f"# Escalation · {agent} · {human()}\n\n{text}\n")
+    journal_write(ad, agent, "escalation", f"{path.name}\n{text}")
+    print(path)
+
+
+def cmd_snapshot(a) -> None:
+    ad = find_ad()
+    src = Path(a.path)
+    if not src.is_absolute():
+        src = (Path.cwd() / src).resolve()
+    if not src.exists():
+        die(f"file not found: {src}")
+    try:
+        rel = src.relative_to(ad)
+        name = str(rel).replace("/", "__")
+    except ValueError:
+        name = src.name
+    dest = ad / "history" / f"{name}.{stamp()}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    journal_write(ad, agent_name(a), "file-snapshot", f"{src.name} → history/{dest.name}" + (f"\n{a.note}" if a.note else ""))
+    print(dest)
+
+
+def load_marks(ad: Path) -> dict:
+    f = ad / "state" / "marks.json"
+    if f.exists():
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def cmd_mark(a) -> None:
+    ad = find_ad()
+    marks = load_marks(ad)
+    marks[a.name] = iso()
+    atomic_write(ad / "state" / "marks.json", json.dumps(marks, ensure_ascii=False, indent=2) + "\n")
+    print(marks[a.name])
+
+
+def cmd_since(a) -> None:
+    ad = find_ad()
+    v = load_marks(ad).get(a.name)
+    print(v or "")
+    if not v:
+        sys.exit(EXIT_ERR)
+
+
+# ───────────────────────── environment and quotas ─────────────────────────
+
+def run_capture(cmd: list[str], timeout: int = 20) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout or "") + (r.stderr or "")
+        return out.strip()
+    except FileNotFoundError:
+        return ""
+    except subprocess.TimeoutExpired:
+        return "(timeout)"
+
+
+def cmd_env(a) -> None:
+    lines = [f"# Environment overview · {human()}", ""]
+    lines += ["## Machine", f"- host: {socket.gethostname()}", f"- OS: {platform.platform()}",
+              f"- python: {platform.python_version()} ({sys.executable})"]
+    try:
+        import yaml  # type: ignore # noqa: F401
+        lines.append("- PyYAML: installed")
+    except ImportError:
+        lines.append("- PyYAML: NOT INSTALLED (pip install pyyaml)")
+    mem = ""
+    if platform.system() == "Linux" and Path("/proc/meminfo").exists():
+        m = re.search(r"MemTotal:\s+(\d+)", Path("/proc/meminfo").read_text())
+        if m:
+            mem = f"{int(m[1]) // 1024 // 1024} GB"
+    elif platform.system() == "Darwin":
+        out = run_capture(["sysctl", "-n", "hw.memsize"])
+        if out.isdigit():
+            mem = f"{int(out) // 1024 ** 3} GB"
+    if mem:
+        lines.append(f"- RAM: {mem}")
+    lines.append(f"- time: {iso()} (zone {now().tzname()})")
+    lines += ["", "## Tools and harnesses"]
+    for tool, args in (("claude", ["--version"]), ("codex", ["--version"]), ("agy", ["--version"]),
+                       ("opencode", ["--version"]), ("git", ["--version"]), ("tmux", ["-V"]), ("jq", ["--version"]),
+                       ("gtimeout", ["--version"]), ("timeout", ["--version"])):
+        path = shutil.which(tool)
+        if not path:
+            lines.append(f"- {tool}: not found")
+            continue
+        ver = run_capture([tool, *args]).splitlines()[0] if run_capture([tool, *args]) else ""
+        lines.append(f"- {tool}: {ver or 'available'} ({path})")
+    lines += ["", "## Models"]
+    codex_cfg = expand("~/.codex/config.toml")
+    if codex_cfg.exists():
+        txt = codex_cfg.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r'^model\s*=\s*"([^"]+)"', txt, re.M)
+        e = re.search(r'^model_reasoning_effort\s*=\s*"([^"]+)"', txt, re.M)
+        lines.append(f"- codex default: {m[1] if m else '?'} / effort {e[1] if e else '?'}")
+    if shutil.which("agy"):
+        out = run_capture(["agy", "models"], timeout=30)
+        if out and re.search(r"sign in|log ?in|not authenticated|credential", out, re.I):
+            lines.append("- agy: not logged in (`agy models` requests sign in); login: `env SSH_CONNECTION=1 agy` or gemini_api_key in auth.json")
+        elif out and "timeout" not in out:
+            lines.append("- agy models:")
+            lines += ["    " + ln for ln in out.splitlines()[:40]]
+    lines.append("- claude: models are specified by aliases opus | sonnet | haiku | fable or a full ID (see environment.md)")
+    lines += ["", "## Container and schedule"]
+    base_info = Path("/etc/artel-base.txt")
+    if base_info.exists():
+        lines.append("- artel container: " + " · ".join(base_info.read_text(encoding="utf-8").split("\n")[:2]).strip(" ·"))
+        disp = os.environ.get("DISPLAY") or ":1"
+        lines.append(f"- display {disp}: " + ("available" if Path(f"/tmp/.X11-unix/X{disp.lstrip(':')}").exists() else "X server is not running (systemctl --user status artel-display)"))
+    else:
+        lines.append("- this is not an artel container (/etc/artel-base.txt missing): check the schedule and permissions with the user")
+    ok, why = signals_ok()
+    lines.append(f"- inter-process signals: {why}")
+    sh = artel_home()
+    rc, so, _ = run_bin(["git", "-C", str(sh), "rev-parse", "--short", "HEAD"], timeout=15)
+    lines.append(f"- artel: {sh}" + (f" (commit {so.strip()})" if rc == 0 and so.strip() else "")
+                 + (", in PATH" if shutil.which("artel") else ", NOT in PATH: export PATH=" + str(sh / "bin") + ":$PATH"))
+    lines += ["", "## User project directory"]
+    try:
+        ad = find_ad()
+    except SystemExit:
+        ad = None
+    if ad:
+        td = team_dir(ad)
+        top = git_toplevel(td)
+        lines.append(f"- {td}" + (" (home directory)" if td.resolve() == Path.home().resolve() else ""))
+        lines.append("- user project git: " + ("present; run history is committed automatically" if top == td.resolve()
+                                           else f"NOT FOUND: {'agents/ is inside another repository ' + str(top) if top else 'git init has not been run; plan history is not tracked'}"))
+        if top and top != td.resolve():
+            lines.append("  WARNING: plans, journal, and prompts will enter the project repository; move agents/ into the user project directory")
+        if top == td.resolve():
+            for secret in (".codex", ".claude", ".ssh", ".config", ".local"):
+                sp_ = td / secret
+                if sp_.exists():
+                    rc, _, _ = run_bin(["git", "-C", str(td), "check-ignore", "-q", secret], timeout=15)
+                    if rc != 0:
+                        lines.append(f"  WARNING: {secret}/ is not ignored by user project git; .gitignore must be an allowlist")
+        src = td / "src"
+        repos = sorted(p for p in src.iterdir() if (p / ".git").exists()) if src.is_dir() else []
+        lines.append("- repositories in src/: " + (", ".join(p.name for p in repos) if repos else "none"))
+        for r in repos:
+            rc, so, _ = run_bin(["git", "-C", str(r), "ls-files", "--error-unmatch", "agents"], timeout=15)
+            if rc == 0:
+                lines.append(f"  WARNING: repository {r.name} tracks agents/ (plan and journal leak)")
+        mounts = []
+        try:
+            for ln in Path("/proc/self/mountinfo").read_text().splitlines():
+                f = ln.split()
+                mp = f[4]
+                if mp.startswith(str(td) + "/") or mp == str(sh):
+                    mounts.append(f"{mp} ({'ro' if 'ro' in f[5].split(',') else 'rw'})")
+        except OSError:
+            pass
+        lines.append("- mounted from outside: " + (", ".join(mounts) if mounts else "nothing; everything lives in the container"))
+        if (td / "scratch").exists():
+            lines.append("- scratch/: present (worker worktrees, not included in git)")
+    if shutil.which("systemctl"):
+        out = run_capture(["systemctl", "--user", "list-timers", "--all", "--no-pager", "--no-legend"])
+        rel = [ln for ln in out.splitlines() if "artel-" in ln]
+        lines.append("- artel timers: " + (f"{len(rel)}" if rel else "none (not registered yet)"))
+        lines += ["    " + " ".join(ln.split()[:5]) + " … " + ln.split()[-2] for ln in rel[:12]]
+        out = run_capture(["systemctl", "--user", "list-units", "--type=service", "--no-pager", "--plain", "--no-legend"])
+        rel = [ln for ln in out.splitlines() if re.search(r"artel-|claude|codex|agy|opencode", ln, re.I)]
+        if rel:
+            lines.append("- systemd --user services:")
+            lines += ["    " + ln.strip() for ln in rel]
+    if shutil.which("nvidia-smi"):
+        gpu = run_capture(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], timeout=15)
+        if gpu and "timeout" not in gpu:
+            lines.append(f"- GPU: {gpu.splitlines()[0]}")
+    lines += ["", "## Quotas", "- snapshot: `artel quota` (cache under 10 min old responds instantly; full polling takes up to a minute: claude via /usage "
+              "or rate-limit headers, agy via /quota, codex via app-server, opencode via connected providers)"]
+    print("\n".join(lines))
+
+
+# ───────────────────────── quotas ─────────────────────────
+# Section rules: print only what is present (installed harnesses, connected
+# providers); when a harness or provider has a problem, print the reason and the fix command.
+
+HARNESSES = ("codex", "claude", "agy", "opencode")
+EXTRA_BIN_DIRS = ("~/.opencode/bin", "~/.local/bin", "~/.npm-global/bin", "~/.bun/bin",
+                  "/opt/homebrew/bin", "/usr/local/bin")
+
+
+def find_bin(name: str) -> str | None:
+    """which() plus common directories missing from PATH in non-interactive sessions."""
+    p = shutil.which(name)
+    if p:
+        return p
+    for d in EXTRA_BIN_DIRS:
+        c = expand(d) / name
+        if c.is_file() and os.access(c, os.X_OK):
+            return str(c)
+    return None
+
+
+def run_bin(cmd: list[str], timeout: int) -> tuple[int | None, str, str]:
+    """→ (returncode | None on timeout, stdout, stderr). A negative code means killed by a signal."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout or "", r.stderr or ""
+    except subprocess.TimeoutExpired as e:
+        so = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        return None, so, "timeout"
+    except FileNotFoundError:
+        return 127, "", "not found"
+
+
+def sigkill_hint(rc: int | None, binary: str) -> str:
+    """macOS kills a binary with an invalid code signature using signal 9 (this happened with brew bottles
+    containing opencode built by bun). Check with codesign; fix by re-signing or reinstalling."""
+    if rc != -9 or sys.platform != "darwin":
+        return ""
+    vrc, _, vse = run_bin(["codesign", "--verify", binary], timeout=60)
+    if vrc in (0, 127, None):
+        return ""
+    why = (vse.strip().splitlines() or ["codesign --verify failed"])[-1].replace(binary + ": ", "")[:120]
+    return (f"; invalid code signature ({why}); macOS kills this binary at startup: "
+            f"`codesign -f -s - {binary}` or reinstall")
+
+
+def explain_rc(rc: int | None, stderr: str) -> str:
+    if rc is None:
+        return "timeout"
+    if rc < 0:
+        return f"process killed by signal {-rc} (broken installation? reinstall the harness)"
+    return (stderr.strip().splitlines() or [f"exit code {rc}"])[-1][:200]
+
+
+def last_json_line(text: str):
+    """Complete JSON (multiline output such as `claude auth status`) or the last JSON line in a stream."""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    for line in reversed((text or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def http_json(url: str, headers: dict | None = None, method: str = "GET", data: dict | None = None,
+              timeout: int = 15) -> tuple[int | None, object]:
+    """→ (HTTP status | None on network error, JSON | text)."""
+    body = json.dumps(data).encode() if data is not None else None
+    hdrs = {"Accept": "application/json", **(headers or {})}
+    if body is not None:
+        hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, method=method, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+            st = r.status
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        st = e.code
+    except socket.timeout:
+        return None, "timeout"
+    except (urllib.error.URLError, OSError) as e:
+        if isinstance(getattr(e, "reason", None), socket.timeout) or "timed out" in str(e):
+            return None, "timeout"
+        return None, str(getattr(e, "reason", e))
+    try:
+        return st, json.loads(raw)
+    except json.JSONDecodeError:
+        return st, raw[:300]
+
+
+def looks_like_auth_problem(text: str) -> bool:
+    return bool(re.search(r"log ?in|login|logged out|sign ?in|unauthoriz|not authenticated|failed to authenticate|credential|re-?auth"
+                          r"|token (is )?(expired|invalid)|invalid bearer token|session expired|401|403",
+                          text or "", re.I))
+
+
+def fmt_usd(v) -> str:
+    try:
+        return f"${float(v):.2f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def fmt_tokens(n) -> str:
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return str(n)
+    for unit, div in (("M", 1e6), ("K", 1e3)):
+        if n >= div:
+            return f"{n / div:.1f}{unit}"
+    return str(int(n))
+
+
+def find_in(obj, key: str):
+    if isinstance(obj, dict):
+        if key in obj and isinstance(obj[key], dict):
+            return obj[key]
+        for v in obj.values():
+            r = find_in(v, key)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = find_in(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+# ── Codex (ChatGPT) ──
+# Live source: `codex app-server` answers account/rateLimits/read with the same request as /status in the TUI,
+# without a model turn or token usage. Fallback source: the last rate_limits object in session files,
+# a snapshot from the last codex request on this machine (possibly weeks old).
+
+CODEX_APP_SERVER_TIMEOUT = 15
+
+
+def codex_live_limits(binary: str, timeout: float = CODEX_APP_SERVER_TIMEOUT) -> tuple[dict | None, str | None]:
+    """Line-oriented JSON-RPC over stdio: initialize → initialized → account/rateLimits/read. → (result, None) | (None, error).
+    stdout and stderr go to files, and the process is killed with killpg: with pipes, app-server children keep
+    descriptors open and reading hangs."""
+    out_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    err_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.Popen([binary, "app-server"], stdin=subprocess.PIPE, stdout=out_f, stderr=err_f,
+                                text=True, start_new_session=True)
+    except OSError as e:
+        out_f.close()
+        err_f.close()
+        return None, f"could not start `codex app-server`: {e}"
+    try:
+        try:
+            for msg in ({"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "artel", "version": "0"}}},
+                        {"method": "initialized"},
+                        {"id": 2, "method": "account/rateLimits/read", "params": {}}):
+                proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
+        except OSError:
+            pass  # process is already dead; the exit code will show the reason
+        deadline = time.time() + timeout
+        while True:
+            out_f.seek(0)
+            for line in out_f.read().splitlines():
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict) and obj.get("id") == 2:
+                    if obj.get("error"):
+                        err = obj["error"]
+                        msg = err.get("message") if isinstance(err, dict) else err
+                        return None, f"account/rateLimits/read: {str(msg)[:200]}"
+                    return obj.get("result") or {}, None
+            if proc.poll() is not None:
+                err_f.seek(0)
+                tail = [ln.strip() for ln in err_f.read().splitlines() if ln.strip()][-2:]
+                return None, "`codex app-server` exited: " + (" | ".join(tail)[:300] or explain_rc(proc.returncode, ""))
+            if time.time() > deadline:
+                return None, f"`codex app-server` did not respond within {timeout:g}s"
+            time.sleep(0.2)
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        out_f.close()
+        err_f.close()
+
+
+def codex_rl_from_live(res: dict) -> dict:
+    """app-server response (camelCase) → the same shape as rate_limits in session files (snake_case)."""
+    rl = res.get("rateLimits") or {}
+
+    def win(w):
+        if not isinstance(w, dict):
+            return None
+        return {"used_percent": w.get("usedPercent"), "window_minutes": w.get("windowDurationMins"), "resets_at": w.get("resetsAt")}
+
+    cr = rl.get("credits") or {}
+    out = {"plan_type": rl.get("planType"), "primary": win(rl.get("primary")), "secondary": win(rl.get("secondary")),
+           "credits": {"has_credits": cr.get("hasCredits"), "unlimited": cr.get("unlimited"), "balance": cr.get("balance")},
+           "rate_limit_reached_type": rl.get("rateLimitReachedType")}
+    rc = res.get("rateLimitResetCredits")
+    if isinstance(rc, dict):
+        avail = [c for c in (rc.get("credits") or []) if isinstance(c, dict) and c.get("status") == "available"]
+        out["reset_credits"] = rc.get("availableCount") if rc.get("availableCount") is not None else len(avail)
+        exps = [c["expiresAt"] for c in avail if isinstance(c.get("expiresAt"), (int, float))]
+        if exps:
+            try:
+                out["reset_credit_expires"] = human(dt.datetime.fromtimestamp(min(exps)).astimezone())
+            except (OverflowError, OSError, ValueError):
+                pass
+    return out
+
+
+def codex_snapshot_from_sessions(home: Path) -> tuple[dict | None, str | None]:
+    """Latest rate_limits from session files. → (snapshot, None) | (None, reason)."""
+    sessions = home / "sessions"
+    if not sessions.exists():
+        return None, "codex session directory not found; no rate-limit snapshot"
+    files = sorted(sessions.glob("*/*/*/rollout-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:40]
+    for f in files:
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rl = find_in(obj, "rate_limits")
+            if rl:
+                observed = dt.datetime.fromtimestamp(f.stat().st_mtime).astimezone()
+                age_h = (dt.datetime.now().astimezone() - observed).total_seconds() / 3600
+                return {"source": str(f), "observed": iso(observed), "age_hours": round(age_h, 1), "rate_limits": rl}, None
+    return None, "no rate_limits in session files (codex has not made a request from here yet)"
+
+
+def codex_quota(home: Path, binary: str | None) -> dict:
+    out: dict = {"login": None, "live": None, "snapshot": None}
+    if binary:
+        rc, so, se = run_bin([binary, "login", "status"], timeout=20)
+        text = (so + se).strip()
+        if rc == 0 and text:
+            out["login"] = text.splitlines()[-1]
+            if re.search(r"not logged in", text, re.I):
+                out["problem"] = "not logged in: run `codex login`"
+        elif rc is not None and rc != 0 and re.search(r"not logged in", text, re.I):
+            out["login"] = "Not logged in"
+            out["problem"] = "not logged in: run `codex login`"
+        else:
+            out["login_error"] = explain_rc(rc, se or so)
+        if not out.get("problem"):
+            res, err = codex_live_limits(binary)
+            if res is not None:
+                out["live"] = {"observed": iso(), "rate_limits": codex_rl_from_live(res)}
+                return out
+            out["live_error"] = err
+    snap, note = codex_snapshot_from_sessions(home)
+    if snap:
+        out["snapshot"] = snap
+    else:
+        out["snapshot_note"] = note
+    return out
+
+
+def fmt_window(w: dict | None, label: str, now_ts: float | None = None) -> str | None:
+    """Format a window. With now_ts, a window whose reset has passed is marked unknown (the snapshot is stale)."""
+    if not w:
+        return None
+    used = w.get("used_percent")
+    if isinstance(used, float) and used.is_integer():
+        used = int(used)
+    mins = w.get("window_minutes")
+    reset = w.get("resets_at")
+    reset_ts = None
+    reset_s = "?"
+    try:
+        if reset is not None:
+            reset_ts = int(reset)
+            reset_s = human(dt.datetime.fromtimestamp(reset_ts).astimezone())
+    except (TypeError, ValueError, OverflowError, OSError):
+        reset_s = str(reset)
+    if now_ts is not None and reset_ts is not None and reset_ts < now_ts:
+        return f"- {label}: reset at {reset_s}, already after the snapshot; current usage is unknown"
+    return f"- {label}: {used}% used · {mins} min window · reset {reset_s}"
+
+
+def fmt_codex(cq: dict) -> list[str]:
+    lines = []
+    if cq.get("problem"):
+        lines.append(f"- PROBLEM: {cq['problem']}")
+    elif cq.get("login"):
+        lines.append(f"- login: {cq['login']}")
+    if cq.get("login_error"):
+        lines.append(f"- `codex login status` did not respond: {cq['login_error']}")
+    live = cq.get("live")
+    snap = cq.get("snapshot")
+    if live:
+        rl = live["rate_limits"]
+        now_ts = None
+        lines.append(f"- plan: {rl.get('plan_type') or '?'} · live request via `codex app-server`")
+    elif snap:
+        if cq.get("live_error"):
+            lines.append(f"- live request failed ({cq['live_error']}); snapshot from session files follows")
+        rl = snap["rate_limits"]
+        now_ts = time.time()
+        lines.append(f"- plan: {rl.get('plan_type') or '?'} · snapshot from {snap['observed']} "
+                     "(time of the last codex request from this machine)")
+    else:
+        if cq.get("live_error"):
+            lines.append(f"- live request failed ({cq['live_error']})")
+        lines.append(f"- {cq.get('snapshot_note', 'no rate-limit snapshot')}")
+        return lines
+    for w, label in ((rl.get("primary"), "5h window (primary)"), (rl.get("secondary"), "1-week window (secondary)")):
+        s = fmt_window(w, label, now_ts)
+        if s:
+            lines.append(s)
+    if rl.get("rate_limit_reached_type"):
+        lines.append(f"- LIMIT REACHED: {rl['rate_limit_reached_type']}")
+    cr = rl.get("credits") or {}
+    if cr.get("has_credits") or cr.get("unlimited") or str(cr.get("balance") or "0") not in ("0", "0.0", ""):
+        lines.append(f"- credits: {'unlimited' if cr.get('unlimited') else cr.get('balance')}")
+    if rl.get("reset_credits"):
+        exp = rl.get("reset_credit_expires")
+        lines.append(f"- free account limit resets: {rl['reset_credits']}" + (f" (next expires {exp})" if exp else ""))
+    return lines
+
+
+# ── Claude ──
+
+CLAUDE_PROBE_MODEL = "claude-haiku-4-5"
+CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
+
+
+def claude_token_from_env() -> str | None:
+    """CLAUDE_CODE_OAUTH_TOKEN from the environment, or from ~/.config/artel/auth.env (written by apply-auth.sh)."""
+    tok = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if tok:
+        return tok
+    try:
+        for ln in expand("~/.config/artel/auth.env").read_text(encoding="utf-8").splitlines():
+            m = re.match(r"\s*(?:export\s+)?CLAUDE_CODE_OAUTH_TOKEN=(.*)$", ln)
+            if m:
+                v = m[1].strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                    v = v[1:-1]
+                return v or None
+    except OSError:
+        pass
+    return None
+
+
+def claude_ratelimit_probe(token: str, timeout: int = 20) -> dict:
+    """Subscription quota percentages from anthropic-ratelimit-unified-* headers on a probe request to haiku
+    (max_tokens=1, about 25 tokens). Needed when logged in with a `claude setup-token` token: it lacks
+    the user:profile scope, the /api/oauth/usage quota endpoint returns 403 (oauth_scope_insufficient), and
+    `claude -p /usage` silently prints a cost summary without percentages. Verified 2026-10-25."""
+    body = {"model": CLAUDE_PROBE_MODEL, "max_tokens": 1,
+            "system": "You are Claude Code, Anthropic's official CLI for Claude.",
+            "messages": [{"role": "user", "content": "hi"}]}
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(body).encode(), method="POST",
+                                 headers={"Authorization": f"Bearer {token}", "anthropic-version": "2023-06-01",
+                                          "anthropic-beta": CLAUDE_OAUTH_BETA, "Content-Type": "application/json",
+                                          "User-Agent": "artel-quota"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            hdrs, st, raw = dict(r.headers), r.status, r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        hdrs, st, raw = dict(e.headers), e.code, e.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError) as e:
+        timed = isinstance(e, socket.timeout) or isinstance(getattr(e, "reason", None), socket.timeout) or "timed out" in str(e)
+        return {"error": "timeout" if timed else str(getattr(e, "reason", e))}
+    h = {k.lower(): v for k, v in hdrs.items()}
+
+    def pct(key):
+        try:
+            return round(float(h[key]) * 100)
+        except (KeyError, ValueError):
+            return None
+
+    def reset_s(key):
+        try:
+            return human(dt.datetime.fromtimestamp(int(h[key])).astimezone())
+        except (KeyError, ValueError, OverflowError, OSError):
+            return "?"
+    windows = []
+    for key, name in (("5h", "Current session (5h)"), ("7d", "Current week (all models)")):
+        p = pct(f"anthropic-ratelimit-unified-{key}-utilization")
+        if p is None:
+            continue
+        windows.append({"name": name, "used_percent": p, "resets": reset_s(f"anthropic-ratelimit-unified-{key}-reset"),
+                        "status": h.get(f"anthropic-ratelimit-unified-{key}-status")})
+    out: dict = {"windows": windows, "status": h.get("anthropic-ratelimit-unified-status"), "http": st}
+    if not windows:
+        msg = raw[:300]
+        try:
+            msg = (json.loads(raw).get("error") or {}).get("message") or msg
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        out["error"] = f"HTTP {st}: {msg}"
+    return out
+
+
+def claude_usage(binary: str, timeout: int = 90) -> dict:
+    """`claude auth status` returns the login and subscription type. With a claude.ai session login, percentages come from
+    `claude -p "/usage"` (text without a model turn or quota usage: `Current week (Fable): 43% used ·
+    resets Oct 7 at 11am (UTC)`). With a setup-token login (`authMethod: oauth_token`), /usage
+    never returns percentages (no user:profile scope), so percentages are read from rate-limit headers
+    on a probe request (claude_ratelimit_probe)."""
+    out: dict = {}
+    token = claude_token_from_env()
+    if token and not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        # shell without auth.env (sudo -iu artel bash -c …): give claude the same login systemd agents see
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    rc, so, se = run_bin([binary, "auth", "status"], timeout=30)
+    st = last_json_line(so)   # JSON is printed even with a nonzero code (setup-token login returns rc 1)
+    if isinstance(st, dict) and "loggedIn" in st:
+        out["auth"] = {k: st.get(k) for k in ("loggedIn", "authMethod", "subscriptionType", "apiProvider") if st.get(k) is not None}
+        if not st.get("loggedIn"):
+            out["problem"] = "not logged in: run `claude auth login`"
+            return out
+    elif rc is not None and rc != 0 and looks_like_auth_problem(so + se):
+        out["problem"] = "not logged in: run `claude auth login` (" + explain_rc(rc, se or so) + ")"
+        return out
+    else:
+        out["auth_error"] = explain_rc(rc, se or so)
+    if (out.get("auth") or {}).get("authMethod") == "oauth_token" and token:
+        probe = claude_ratelimit_probe(token)
+        out["source"] = "headers"
+        out["windows"] = probe.get("windows") or []
+        out["status"] = probe.get("status")
+        if probe.get("error"):
+            out["problem" if looks_like_auth_problem(probe["error"]) else "usage_error"] = probe["error"]
+        return out
+    rc, so, se = run_bin([binary, "-p", "/usage", "--output-format", "json"], timeout=timeout)
+    data = last_json_line(so)
+    text = (data or {}).get("result") or "" if isinstance(data, dict) else ""
+    if not text:
+        reason = explain_rc(rc, se or so) if rc != 0 else (se or so or "empty response").strip()[-300:]
+        out["problem" if looks_like_auth_problem(reason) else "usage_error"] = reason
+        return out
+    windows = []
+    for ln in text.splitlines():
+        m = re.match(r"\s*(.+?):\s*(\d+)%\s*used\s*[·\-–]\s*resets?\s*(.+?)\s*$", ln)
+        if m:
+            windows.append({"name": m[1].strip(), "used_percent": int(m[2]), "resets": m[3].strip()})
+    out["source"] = "usage"
+    out["windows"] = windows
+    out["header"] = text.strip().splitlines()[0] if text.strip() else ""
+    if not windows:
+        if token:   # summary without percentages: token exists, try headers
+            probe = claude_ratelimit_probe(token)
+            if probe.get("windows"):
+                out.update(source="headers", windows=probe["windows"], status=probe.get("status"))
+                return out
+        out["raw"] = text
+    return out
+
+
+def fmt_claude(c: dict) -> list[str]:
+    lines = []
+    if c.get("problem"):
+        return [f"- PROBLEM: {c['problem']}"]
+    a = c.get("auth") or {}
+    if a:
+        lines.append(f"- login: {a.get('authMethod', '?')}" + (f" · subscription {a['subscriptionType']}" if a.get("subscriptionType") else ""))
+    if c.get("auth_error"):
+        lines.append(f"- `claude auth status` did not respond: {c['auth_error']}")
+    src = c.get("source")
+    if c.get("usage_error"):
+        lines.append(("- rate-limit header probe failed: " if src == "headers" else "- /usage did not respond: ") + c["usage_error"])
+    elif not c.get("windows"):
+        if a.get("authMethod") == "oauth_token":
+            lines.append("- percentages unavailable: the setup-token lacks the user:profile scope, /usage does not provide them, "
+                         "and CLAUDE_CODE_OAUTH_TOKEN was not found in the environment or ~/.config/artel/auth.env for the probe.")
+        elif c.get("raw"):
+            lines.append("- could not parse the /usage response; raw text:")
+            lines += ["    " + ln for ln in c["raw"].splitlines()[:8]]
+    else:
+        if c.get("header"):
+            lines.append(f"- {c['header']}")
+        for w in c["windows"]:
+            warn = f" · {w['status']}" if w.get("status") and w["status"] != "allowed" else ""
+            lines.append(f"- {w['name']}: {w['used_percent']}% used · reset {w['resets']}{warn}")
+        if src == "headers":
+            lines.append("- source: rate-limit headers on a haiku probe request (about 25 tokens); the setup-token lacks "
+                         "the user:profile scope, so /usage provides no percentages. Model windows (Fable) are not visible this way.")
+    return lines
+
+
+# ── Antigravity (agy) ──
+
+def agy_quota(binary: str, timeout: int = 30) -> dict:
+    """`agy -p=/quota --output-format json` responds without quota usage or a model turn (usually in 3–6s).
+    Without a login, `/quota` hangs silently until timeout, so first run the fast `agy models`, which immediately requests sign in."""
+    out: dict = {}
+    rc, so, se = run_bin([binary, "models"], timeout=15)
+    if re.search(r"sign in|log ?in|not authenticated|credential", so + se, re.I):
+        out["problem"] = "not logged in: `agy models` requests sign in; login with `env SSH_CONNECTION=1 agy` or gemini_api_key in auth.json"
+        return out
+    for cmd_name in ("quota", "credits"):
+        rc, so, se = run_bin([binary, f"-p=/{cmd_name}", "--output-format", "json"], timeout=timeout)
+        data = last_json_line(so)
+        if not isinstance(data, dict):
+            reason = explain_rc(rc, se or so) if rc != 0 else (se or so or "empty response").strip()[-300:]
+            out[cmd_name] = {"error": reason}
+            if looks_like_auth_problem(reason):
+                out["problem"] = f"login problem suspected: {reason} — log in interactively (`agy`, then /login)"
+            break  # do not ask /credits after /quota fails; the reason is the same
+        payload = (data.get("command") or {}).get("data")
+        out[cmd_name] = payload or {"error": "command.data missing", "raw": data}
+    return out
+
+
+def fmt_agy(aq: dict) -> list[str]:
+    lines = []
+    if aq.get("problem"):
+        return [f"- PROBLEM: {aq['problem']}"]
+    q = aq.get("quota") or {}
+    if q.get("error"):
+        lines.append(f"- /quota did not respond: {q['error']}")
+    for g in q.get("groups") or []:
+        parts = []
+        for b in g.get("buckets") or []:
+            frac = b.get("remaining_fraction")
+            used = f"{round((1 - float(frac)) * 100)}%" if frac is not None else "?"
+            reset = b.get("reset_time", "?")
+            try:
+                reset = human(dt.datetime.fromisoformat(str(reset).replace("Z", "+00:00")).astimezone())
+            except ValueError:
+                pass
+            parts.append(f"{b.get('window', '?')}: {used} used, reset {reset}")
+        lines.append(f"- {g.get('name', '?')}: " + " · ".join(parts))
+    c = aq.get("credits") or {}
+    if "remaining_credits" in c:
+        lines.append(f"- G1 credits: {c['remaining_credits']}")
+    return lines or ["- no data"]
+
+
+# ── OpenCode (BYOK client: quotas belong to providers, not the harness) ──
+
+def opencode_paths(binary: str) -> dict:
+    rc, so, _ = run_bin([binary, "debug", "paths"], timeout=20)
+    paths = {}
+    if rc == 0:
+        for ln in so.splitlines():
+            m = re.match(r"\s*(\w+)\s+(\S.*)$", ln)
+            if m:
+                paths[m[1]] = m[2].strip()
+    paths.setdefault("data", str(expand("~/.local/share/opencode")))
+    paths.setdefault("config", str(expand("~/.config/opencode")))
+    return paths
+
+
+def opencode_serve_providers(binary: str, cwd: Path, timeout: int = 25) -> tuple[dict | None, str | None]:
+    """Start `opencode serve` on a free port, read /provider and /config/providers, and stop the server.
+    This is the only source that sees providers exactly as opencode does (auth.json + config +
+    environment variables + plugins)."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    headers = {}
+    pw = os.environ.get("OPENCODE_SERVER_PASSWORD")
+    if pw:
+        import base64
+        headers["Authorization"] = "Basic " + base64.b64encode(f"opencode:{pw}".encode()).decode()
+    log = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.Popen([binary, "serve", "--port", str(port)], cwd=str(cwd), stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL)
+    except OSError as e:
+        return None, f"could not start `opencode serve`: {e}"
+    url = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.time() + timeout
+        up = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                log.seek(0)
+                tail = log.read().strip().splitlines()[-3:]
+                return None, "`opencode serve` exited: " + (" | ".join(tail) or explain_rc(proc.returncode, ""))
+            st, _ = http_json(url + "/provider", headers, timeout=3)
+            if st == 200:
+                up = True
+                break
+            time.sleep(0.3)
+        if not up:
+            return None, f"`opencode serve` did not start within {timeout}s"
+        st1, prov = http_json(url + "/provider", headers, timeout=15)
+        st2, cfg = http_json(url + "/config/providers", headers, timeout=15)
+        if st1 != 200 or not isinstance(prov, dict):
+            return None, f"/provider returned {st1}: {str(prov)[:200]}"
+        return {"provider": prov, "config": cfg if st2 == 200 and isinstance(cfg, dict) else {}}, None
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        log.close()
+
+
+def opencode_auth_file(data_dir: str) -> dict:
+    p = Path(data_dir) / "auth.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def opencode_key_ref(config_dir: str, cwd: Path, pid: str) -> str | None:
+    """What the config contains in provider.<id>.options.apiKey ({file:…}/{env:…} template), while the server returns
+    the already expanded value. The project opencode.json(c) takes precedence over the global one."""
+    cands = [cwd / "opencode.jsonc", cwd / "opencode.json", Path(config_dir) / "opencode.jsonc", Path(config_dir) / "opencode.json"]
+    for c in cands:
+        try:
+            txt = c.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        txt = re.sub(r"^\s*//.*$", "", txt, flags=re.M)
+        try:
+            cfg = json.loads(txt)
+        except json.JSONDecodeError:
+            continue
+        ref = (((cfg.get("provider") or {}).get(pid) or {}).get("options") or {}).get("apiKey")
+        if ref is not None:
+            return f"{c}: apiKey = {ref!r}"
+    return None
+
+
+def opencode_usage(data_dir: str, days: int) -> list[dict] | None:
+    """Usage by model from opencode.db over the last N days (assistant messages)."""
+    db = Path(data_dir) / "opencode.db"
+    if not db.exists():
+        return None
+    import sqlite3
+    agg: dict[tuple, dict] = {}
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        since = int((time.time() - days * 86400) * 1000)
+        rows = con.execute("select data from message where time_created > ? and data like '%\"role\":\"assistant\"%'", (since,))
+        for (data,) in rows:
+            try:
+                m = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if m.get("role") != "assistant":
+                continue
+            key = (m.get("providerID") or "?", m.get("modelID") or "?")
+            a = agg.setdefault(key, {"provider": key[0], "model": key[1], "messages": 0, "input": 0, "output": 0, "cache_read": 0, "cost": 0.0})
+            t = m.get("tokens") or {}
+            a["messages"] += 1
+            a["input"] += int(t.get("input") or 0)
+            a["output"] += int(t.get("output") or 0) + int(t.get("reasoning") or 0)
+            a["cache_read"] += int((t.get("cache") or {}).get("read") or 0)
+            a["cost"] += float(m.get("cost") or 0)
+        con.close()
+    except sqlite3.Error as e:
+        return [{"error": f"opencode.db: {e}"}]
+    return sorted(agg.values(), key=lambda a: -(a["input"] + a["output"] + a["cache_read"]))
+
+
+def _bearer(key: str) -> dict:
+    return {"Authorization": f"Bearer {key}"}
+
+
+def probe_openrouter(key: str, p: dict) -> None:
+    st, d = http_json("https://openrouter.ai/api/v1/auth/key", _bearer(key))
+    if st in (401, 403):
+        p["problem"] = f"key rejected ({st})"
+        return
+    if st != 200 or not isinstance(d, dict):
+        p["note"] = f"balance unavailable: {st} {str(d)[:120]}"
+        return
+    k = d.get("data") or {}
+    st2, c = http_json("https://openrouter.ai/api/v1/credits", _bearer(key))
+    bal = {}
+    if st2 == 200 and isinstance(c, dict):
+        cd = c.get("data") or {}
+        bal = {"total_credits": cd.get("total_credits"), "total_usage": cd.get("total_usage")}
+    bal.update({"key_usage": k.get("usage"), "key_limit": k.get("limit"), "key_limit_remaining": k.get("limit_remaining"),
+                "is_free_tier": k.get("is_free_tier")})
+    p["balance"] = bal
+    parts = []
+    if bal.get("total_credits") is not None:
+        parts.append(f"balance {fmt_usd(float(bal['total_credits']) - float(bal.get('total_usage') or 0))}"
+                     f" (purchased {fmt_usd(bal['total_credits'])}, used {fmt_usd(bal.get('total_usage') or 0)})")
+    if k.get("limit") is not None:
+        parts.append(f"key limit {fmt_usd(k['limit'])}, remaining {fmt_usd(k.get('limit_remaining'))}")
+    if k.get("is_free_tier"):
+        parts.append("free tier")
+    p["summary"] = " · ".join(parts) or "key accepted"
+
+
+def probe_vercel(key: str, p: dict) -> None:
+    st, d = http_json("https://ai-gateway.vercel.sh/v1/credits", _bearer(key))
+    if st in (401, 403):
+        p["problem"] = f"key rejected ({st})"
+    elif st == 200 and isinstance(d, dict) and "balance" in d:
+        p["balance"] = {"balance": d.get("balance"), "total_used": d.get("total_used")}
+        p["summary"] = f"balance {fmt_usd(d['balance'])} · used {fmt_usd(d.get('total_used'))}"
+    else:
+        p["note"] = f"balance unavailable: {st} {str(d)[:120]}"
+
+
+def probe_nvidia(key: str, p: dict) -> None:
+    """NVIDIA Build has no balance (free tier with a per-minute request limit), and GET /models does not validate
+    the key. A bad key is rejected in a fraction of a second (403); a good key queues the request, so a short
+    timeout without rejection means “key accepted”. The body is invalid (empty messages), so no tokens are spent."""
+    st, d = http_json("https://integrate.api.nvidia.com/v1/chat/completions", _bearer(key), method="POST",
+                      data={"model": "z-ai/glm-5.3-flash", "messages": [], "max_tokens": 1}, timeout=6)
+    if st in (401, 403):
+        p["problem"] = f"key rejected ({st})"
+    elif st is None and d == "timeout":
+        p["summary"] = "key accepted (no rejection within 6s) · no balance: free tier, per-minute request limit"
+    elif st is None:
+        p["note"] = f"could not verify key: {d}"
+    else:
+        p["summary"] = "key accepted · no balance: free tier, per-minute request limit"
+
+
+def probe_deepseek(key: str, p: dict) -> None:
+    """Not tested with a live key (DeepSeek documentation: GET /user/balance)."""
+    st, d = http_json("https://api.deepseek.com/user/balance", _bearer(key))
+    if st in (401, 403):
+        p["problem"] = f"key rejected ({st})"
+    elif st == 200 and isinstance(d, dict):
+        infos = d.get("balance_infos") or []
+        p["balance"] = {"is_available": d.get("is_available"), "balances": infos}
+        p["summary"] = " · ".join(f"balance {b.get('total_balance')} {b.get('currency', '')}" for b in infos) or "key accepted"
+        if d.get("is_available") is False:
+            p["problem"] = "balance exhausted"
+    else:
+        p["note"] = f"balance unavailable: {st} {str(d)[:120]}"
+
+
+def probe_moonshot(key: str, p: dict, host: str = "api.moonshot.ai") -> None:
+    """Not tested with a live key (Moonshot documentation: GET /v1/users/me/balance)."""
+    st, d = http_json(f"https://{host}/v1/users/me/balance", _bearer(key))
+    if st in (401, 403):
+        p["problem"] = f"key rejected ({st})"
+    elif st == 200 and isinstance(d, dict):
+        bal = (d.get("data") or {}).get("available_balance")
+        p["balance"] = d.get("data")
+        p["summary"] = f"available balance {bal}"
+    else:
+        p["note"] = f"balance unavailable: {st} {str(d)[:120]}"
+
+
+def probe_copilot(auth: dict, p: dict) -> None:
+    """Not tested with a live login. The GitHub token is in the refresh field of the github-copilot OAuth entry;
+    copilot_internal/user returns quota_snapshots for premium requests."""
+    token = auth.get("refresh")
+    if not token:
+        p["note"] = "no GitHub token in auth.json"
+        return
+    st, d = http_json("https://api.github.com/copilot_internal/user",
+                      {"Authorization": f"token {token}", "Editor-Version": "vscode/1.100.0", "User-Agent": "artel"})
+    if st in (401, 403):
+        p["problem"] = f"GitHub token rejected ({st}): `opencode providers login -p github-copilot`"
+    elif st == 200 and isinstance(d, dict):
+        snaps = d.get("quota_snapshots") or {}
+        prem = snaps.get("premium_interactions") or {}
+        p["balance"] = {"plan": d.get("copilot_plan"), "premium": prem, "reset": d.get("quota_reset_date")}
+        if prem:
+            p["summary"] = (f"plan {d.get('copilot_plan', '?')} · premium requests: {prem.get('remaining')} of "
+                            f"{prem.get('entitlement')} remaining ({prem.get('percent_remaining')}%) · reset {d.get('quota_reset_date', '?')}")
+        else:
+            p["summary"] = f"plan {d.get('copilot_plan', '?')}"
+    else:
+        p["note"] = f"quota unavailable: {st} {str(d)[:120]}"
+
+
+PROVIDER_PROBES = {
+    "openrouter": probe_openrouter,
+    "vercel": probe_vercel,
+    "nvidia": probe_nvidia,
+    "deepseek": probe_deepseek,
+    "moonshotai": probe_moonshot,
+    "moonshotai-cn": lambda key, p: probe_moonshot(key, p, "api.moonshot.cn"),
+}
+SHARED_POOL_NOTES = {
+    "anthropic": "with OAuth login, quota is shared with the Claude subscription (see the Claude section)",
+    "openai": "with OAuth login, quota is shared with the ChatGPT plan (see the Codex section)",
+}
+
+
+def opencode_quota(binary: str, cwd: Path, days: int = 7) -> dict:
+    out: dict = {"providers": [], "usage": None}
+    rc, so, se = run_bin([binary, "--version"], timeout=20)
+    if rc != 0 or not so.strip():
+        out["problem"] = "binary did not respond: " + explain_rc(rc, se or so) + sigkill_hint(rc, binary)
+        return out
+    out["version"] = so.strip().splitlines()[-1]
+    paths = opencode_paths(binary)
+    out["data_dir"] = paths["data"]
+    auth = opencode_auth_file(paths["data"])
+    served, err = opencode_serve_providers(binary, cwd)
+    if err:
+        out["serve_error"] = err
+        if looks_like_auth_problem(err):
+            out["problem"] = err
+    connected: list[str] = []
+    meta: dict[str, dict] = {}
+    if served:
+        connected = list(served["provider"].get("connected") or [])
+        for p in served["provider"].get("all") or []:
+            meta[p["id"]] = p
+        for p in served["config"].get("providers") or []:
+            meta.setdefault(p["id"], {}).update({k: v for k, v in p.items() if k != "models"})
+    else:  # fallback source: auth.json only
+        connected = list(auth.keys())
+        out.setdefault("notes", []).append("provider list comes only from auth.json (server did not start)")
+    now_ms = time.time() * 1000
+    for pid in connected:
+        m = meta.get(pid, {})
+        a = auth.get(pid) or {}
+        key = m.get("key") or (m.get("options") or {}).get("apiKey") or a.get("key") or a.get("access") or ""
+        if isinstance(key, str) and key.startswith("{") and key.endswith("}"):
+            key = ""  # unexpanded template {file:…}/{env:…}
+        p: dict = {"id": pid, "name": m.get("name") or pid, "source": m.get("source") or a.get("type") or "?",
+                   "auth_type": a.get("type") or ("api" if key else None)}
+        models = m.get("models") or {}
+        free = [mid for mid, mm in models.items() if isinstance(mm, dict) and not any((mm.get("cost") or {}).get(k) for k in ("input", "output"))]
+        if models:
+            p["models"] = len(models)
+            p["free_models"] = len(free)
+        if a.get("type") == "oauth":
+            exp = a.get("expires")
+            try:
+                exp_dt = dt.datetime.fromtimestamp(float(exp) / (1000 if float(exp) > 1e11 else 1)).astimezone()
+                if exp_dt.timestamp() * 1000 < now_ms:
+                    p["note"] = (f"OAuth, access token expired {human(exp_dt)}; opencode will refresh it, and if the first "
+                                 f"request fails with 401, log in again: `opencode providers login -p {pid}`")
+                else:
+                    p["note"] = f"OAuth, token valid until {human(exp_dt)}"
+            except (TypeError, ValueError, OSError):
+                p["note"] = "OAuth"
+            if pid == "github-copilot":
+                probe_copilot(a, p)
+        elif not key and pid == "opencode":
+            p["summary"] = f"not logged in; only free models available ({len(free)})"
+        elif key == "public" and pid == "opencode":
+            p["summary"] = f"not logged in; only free models available ({len(free)})"
+        elif not key:
+            ref = opencode_key_ref(paths["config"], cwd, pid)
+            p["problem"] = "key is empty" + (f"; {ref}" if ref else "") + " — check the file/variable referenced by the config"
+        elif pid in PROVIDER_PROBES:
+            try:
+                PROVIDER_PROBES[pid](key, p)
+            except Exception as e:  # noqa: BLE001 — a probe must not abort the whole snapshot
+                p["note"] = f"probe failed: {e}"
+        else:
+            p["summary"] = "key configured · provider does not expose balance through API"
+        if pid in SHARED_POOL_NOTES and a.get("type") == "oauth":
+            p["shared"] = SHARED_POOL_NOTES[pid]
+        out["providers"].append(p)
+    out["usage_days"] = days
+    out["usage"] = opencode_usage(paths["data"], days)
+    return out
+
+
+def fmt_opencode(oc: dict) -> list[str]:
+    lines = []
+    if oc.get("problem"):
+        lines.append(f"- PROBLEM: {oc['problem']}")
+        if not oc.get("providers"):
+            return lines
+    elif oc.get("serve_error"):
+        lines.append(f"- {oc['serve_error']}")
+    for n in oc.get("notes") or []:
+        lines.append(f"- {n}")
+    src_ru = {"api": "key from auth.json", "config": "key from config", "env": "key from environment variable", "custom": "built-in", "oauth": "OAuth"}
+    for p in oc.get("providers") or []:
+        head = f"- {p['id']} ({p['name']}, {src_ru.get(p.get('source'), p.get('source'))})"
+        if p.get("problem"):
+            lines.append(f"{head}: PROBLEM: {p['problem']}")
+            continue
+        parts = [x for x in (p.get("summary"), p.get("note"), p.get("shared")) if x]
+        lines.append(f"{head}: " + (" · ".join(parts) or "connected"))
+    if not oc.get("providers") and not oc.get("problem"):
+        lines.append("- no connected providers: `opencode providers login`")
+    usage = oc.get("usage")
+    if usage:
+        if usage and usage[0].get("error"):
+            lines.append(f"- usage: {usage[0]['error']}")
+        else:
+            lines.append(f"- usage over {oc.get('usage_days', 7)} days by model (input / output / cache read / $):")
+            for u in [u for u in usage if u["input"] + u["output"] + u["cache_read"] > 0][:8]:
+                lines.append(f"    {u['provider']}/{u['model']}: {u['messages']} messages · {fmt_tokens(u['input'])} / "
+                             f"{fmt_tokens(u['output'])} / {fmt_tokens(u['cache_read'])} / {fmt_usd(u['cost'])}")
+    return lines
+
+
+# ── assembly ──
+# Full polling takes up to a minute (codex app-server, opencode serve, agy, and the Claude probe run
+# in parallel, but the slowest holds everyone up). The snapshot is therefore cached in agents/state/quota.json:
+# by default, a cache younger than QUOTA_CACHE_SEC is returned; the artel-<project>-quota timer refreshes it.
+
+QUOTA_CACHE_SEC = 600
+QUOTA_TIMER_CALENDAR = "*:0/20"   # every 20 minutes by the clock; OnUnitActiveSec is unsuitable: it does not start without a first run
+
+
+def quota_cache_file() -> Path | None:
+    try:
+        return state_dir(find_ad()) / "quota.json"
+    except SystemExit:
+        return None
+
+
+def quota_cache_read(path: Path | None) -> dict | None:
+    if not path:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["_age_sec"] = max(0, int(time.time() - dt.datetime.fromisoformat(data["observed_now"]).timestamp()))
+        return data
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cmd_quota(a) -> None:
+    import concurrent.futures as cf
+    only = {s.strip() for s in (a.only or "").split(",") if s.strip()}
+    if only - set(HARNESSES):
+        die(f"--only: unknown harnesses {sorted(only - set(HARNESSES))}; allowed: {', '.join(HARNESSES)}", EXIT_ERR)
+    skip = set()
+    if a.no_agy:
+        skip.add("agy")
+    if a.no_opencode:
+        skip.add("opencode")
+    bins = {h: find_bin(h) for h in HARNESSES}
+    todo = [h for h in HARNESSES if bins[h] and h not in skip and (not only or h in only)]
+    missing = [h for h in HARNESSES if not bins[h] and (not only or h in only)]
+    cache_path = quota_cache_file()
+    cached = None if a.fresh else quota_cache_read(cache_path)
+    if cached and all(h in cached for h in todo) and (a.cached or cached["_age_sec"] <= QUOTA_CACHE_SEC):
+        out = cached
+        out["cached"] = True
+    else:
+        if a.cached and not cached:
+            print("artel quota: no quota snapshot cache yet; running full poll", file=sys.stderr)
+        project_dir = Path.cwd()
+        for d in [project_dir.resolve(), *project_dir.resolve().parents]:
+            if (d / "agents" / "config.yaml").exists():
+                project_dir = d
+                break
+            if d.name == "agents" and (d / "config.yaml").exists():
+                project_dir = d.parent
+                break
+        jobs = {
+            "codex": lambda: codex_quota(expand(a.codex_home or "~/.codex"), bins["codex"]),
+            "claude": lambda: claude_usage(bins["claude"]),
+            "agy": lambda: agy_quota(bins["agy"]),
+            "opencode": lambda: opencode_quota(bins["opencode"], project_dir, a.days),
+        }
+        out = {"observed_now": iso(), "missing": missing, "skipped": sorted(skip)}
+        with cf.ThreadPoolExecutor(max_workers=len(todo) or 1) as ex:
+            futs = {h: ex.submit(jobs[h]) for h in todo}
+            for h, f in futs.items():
+                try:
+                    out[h] = f.result()
+                except Exception as e:  # noqa: BLE001 — one harness must not abort the snapshot
+                    out[h] = {"problem": f"collector failure: {e!r}"}
+        if cache_path and not only and not skip:   # cache only a full snapshot; a partial one would impoverish it
+            try:
+                atomic_write(cache_path, json.dumps(out, ensure_ascii=False, indent=1, default=str))
+            except OSError as e:
+                print(f"artel quota: cache not written: {e}", file=sys.stderr)
+    if a.quiet:
+        return
+    if a.json:
+        print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+        return
+    if out.get("cached"):
+        print(f"# Quotas · snapshot {out['observed_now'][:16].replace('T', ' ')} ({out['_age_sec'] // 60}m ago, from cache; `--fresh` will poll again)")
+    else:
+        print(f"# Quotas · {human()}")
+    titles = {"codex": "Codex (ChatGPT)", "claude": "Claude", "agy": "Antigravity (agy)", "opencode": "OpenCode"}
+    fmts = {"codex": fmt_codex, "claude": fmt_claude, "agy": fmt_agy, "opencode": fmt_opencode}
+    for h in todo:
+        data = out.get(h) or {}
+        title = titles[h] + (f" {data['version']}" if data.get("version") else "")
+        print(f"\n## {title}")
+        for ln in fmts[h](data):
+            print(ln)
+    tail = []
+    if missing:
+        tail.append("not installed: " + ", ".join(missing))
+    if skip:
+        tail.append("skipped by flag: " + ", ".join(sorted(skip)))
+    if tail:
+        print("\n" + " · ".join(f"_{t}_" for t in tail))
+
+
+# ───────────────────────── agent runs: slots, queue, limit ─────────────────────────
+# Design: systemd holds the schedule (timers and services generated by `artel register`), and each
+# agent run goes through `artel run <agent>`: prepare script, slot queue, harness command assembly,
+# prompt substitutions, hard limit, log, journal entry, and slot history.
+
+TERM_GRACE_SEC = 30
+SLOT_POLL_SEC = 2
+SLOT_MAX_WAIT_DEFAULT = "4h"   # how long a run waits for a slot when max_wait is unset: longer than any reasonable holder hard_limit
+TASK_RE = re.compile(r"[a-z][a-z0-9_-]{0,30}")
+PREPARE_SKIP_CODE = 3
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+SESSION_RE = re.compile(r'"(?:session_?id|sessionID|thread_?id|conversation_?id)"\s*:\s*"([^"]+)"', re.I)
+
+
+def agents_cfg(data: dict) -> dict:
+    a = data.get("agents") or {}
+    if not isinstance(a, dict):
+        die("config.yaml: agents must be a name → definition mapping", EXIT_CFG)
+    return a
+
+
+def slots_cfg(data: dict) -> dict:
+    s = data.get("slots") or {}
+    if not isinstance(s, dict):
+        die("config.yaml: slots must be a name → definition mapping", EXIT_CFG)
+    return s
+
+
+def agent_def(data: dict, name: str) -> dict:
+    a = agents_cfg(data).get(name)
+    if not isinstance(a, dict):
+        die(f"agent {name!r} not found in config.yaml; available: {', '.join(agents_cfg(data)) or 'none'}", EXIT_CFG)
+    return a
+
+
+def state_dir(ad: Path) -> Path:
+    d = ad / "state"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+# ── agent tasks: one identity, multiple runs with different tasks ──
+
+TASK_OVERRIDES = ("schedule", "prepare", "prepare_timeout", "prompt", "window", "hard_limit", "max_wait", "session", "env", "enabled")
+
+
+def tasks_cfg(a_def: dict, name: str) -> dict:
+    """Agent tasks section: task name → run-field overrides. The rest (harness, model, slot,
+    identity) is shared by all agent tasks."""
+    t = a_def.get("tasks")
+    if t is None:
+        return {}
+    if not isinstance(t, dict):
+        die(f"agent {name}: tasks must be a task name → run fields mapping", EXIT_CFG)
+    out: dict = {}
+    for k, v in t.items():
+        k = str(k)
+        if not TASK_RE.fullmatch(k):
+            die(f"agent {name}: task name {k!r}: Latin letters, digits, hyphens, no spaces", EXIT_CFG)
+        v = {} if v is None else v
+        if not isinstance(v, dict):
+            die(f"agent {name}: task {k}: expected a field mapping ({', '.join(TASK_OVERRIDES)})", EXIT_CFG)
+        bad = [f for f in v if f not in TASK_OVERRIDES]
+        if bad:
+            die(f"agent {name}: task {k}: fields {', '.join(bad)} are set only at agent level", EXIT_CFG)
+        out[k] = v
+    return out
+
+
+def pick_task(a_def: dict, name: str, requested: str | None) -> str | None:
+    """Which task to run: --task, otherwise the agent task field, otherwise the only task in tasks; multiple tasks without
+    a selection are an error. With no tasks, return None: the agent takes the next task from its PLAN.md."""
+    tasks = tasks_cfg(a_def, name)
+    if requested:
+        if not TASK_RE.fullmatch(requested):
+            die(f"task name {requested!r}: Latin letters, digits, hyphens, no spaces", EXIT_CFG)
+        return requested
+    if a_def.get("task"):
+        return str(a_def["task"])
+    if len(tasks) == 1:
+        return next(iter(tasks))
+    if tasks:
+        die(f"agent {name}: multiple tasks ({', '.join(tasks)}); specify one: artel run {name} --task <name>", EXIT_CFG)
+    return None
+
+
+def task_def(a_def: dict, name: str, task: str | None) -> dict:
+    """Agent definition with task fields overlaid; the task name is in _task (None if there is no task)."""
+    over = tasks_cfg(a_def, name).get(task) if task else None
+    d = {k: v for k, v in a_def.items() if k != "tasks"}
+    if over:
+        env = dict(d.get("env") or {})
+        env.update(over.get("env") or {})
+        d.update(over)
+        if env:
+            d["env"] = env
+    d["_task"] = task
+    return d
+
+
+def agent_variants(name: str, a_def: dict) -> list[tuple[str | None, dict]]:
+    """Timer runs for an agent: one per task in tasks (unit artel-<project>-<agent>.<task>), otherwise one
+    (unit without a suffix, task from the task field or none). Tasks with enabled: false are skipped."""
+    tasks = tasks_cfg(a_def, name)
+    if tasks:
+        out = [(t, task_def(a_def, name, t)) for t in tasks]
+    else:
+        out = [(None, task_def(a_def, name, str(a_def["task"]) if a_def.get("task") else None))]
+    return [(t, d) for t, d in out if d.get("enabled") is not False]
+
+
+def default_prompt(name: str, task: str | None, has_prepare: bool) -> str:
+    """Run prompt when config.yaml has none: identity plus task name. The content lives in
+    agents/agent-<name>.md, so editing it does not require re-registration."""
+    what = (f"work on task “{task}” from the identity's “Tasks” section" if task
+            else f"take the next unfinished task from your agents/team/{name}/PLAN.md")
+    text = (f"You are agent {name} in project {{{{PROJECT}}}} of the artel system. Your identity is agents/agent-{name}.md; "
+            f"it contains everything: who you are, how to work, what you know, what you can do, and which tasks exist. Read it and the "
+            f"artel/charter.md, then {what}. Window ends at {{{{WINDOW_END}}}}; budget {{{{BUDGET_MIN}}}} minutes; "
+            f"hard limit ends at {{{{HARD_END}}}}.")
+    if has_prepare:
+        text += "\nPreparation data:\n{{PREPARE}}"
+    return text
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def fmt_hm(t: dt.datetime) -> str:
+    return t.strftime("%H:%M")
+
+
+# ── slot: FIFO directory queue, holder file ──
+
+def run_key(agent: str, task: str | None) -> str:
+    """Run key in the slot queue: agent or agent.task. Runs with the same key are coalesced;
+    different tasks of one agent queue independently."""
+    return f"{agent}.{task}" if task else agent
+
+
+class Slot:
+    """FIFO queue: one file per waiter in queue/ (enqueue time as the name, JSON with agent, task, and pid),
+    holder in holder.json. A waiter polls the slot every SLOT_POLL_SEC and starts as soon as the holder exits,
+    regardless of how long it ran."""
+
+    def __init__(self, ad: Path, name: str, spec: dict):
+        self.name = name
+        self.spec = spec
+        self.base = state_dir(ad) / "slots" / name
+        self.queue = self.base / "queue"
+        self.queue.mkdir(parents=True, exist_ok=True)
+        self.holder = self.base / "holder.json"
+        self.lock = self.base / ".lock"
+        self.history = self.base / "history.jsonl"
+        self.entry: Path | None = None
+
+    def _entries(self) -> list[tuple[Path, dict]]:
+        out = []
+        for p in sorted(self.queue.iterdir()):
+            try:
+                info = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                info = None
+            if not isinstance(info, dict):   # old-format entry {ns}-{agent}-pid.{pid}
+                m = re.fullmatch(r"\d+-(.+)-pid\.(\d+)", p.name)
+                info = {"agent": m.group(1), "pid": int(m.group(2))} if m else {"agent": "?", "pid": 0}
+            pid = int(info.get("pid") or 0)
+            if pid and not pid_alive(pid):
+                p.unlink(missing_ok=True)   # queued process died; entry is stale
+                continue
+            out.append((p, info))
+        return out
+
+    def holder_info(self) -> dict | None:
+        try:
+            info = json.loads(self.holder.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            info = None
+        if info and not pid_alive(int(info.get("pid") or 0)):
+            self._record({"event": "stale_holder_removed", **{k: info.get(k) for k in ("agent", "task", "pid", "since")}})
+            self.release(force=True)
+            return None
+        return info
+
+    def queued(self) -> list[dict]:
+        return [info for _, info in self._entries()]
+
+    def queued_keys(self) -> list[str]:
+        return [run_key(str(i.get("agent", "?")), i.get("task")) for i in self.queued()]
+
+    def acquire(self, agent: str, task: str | None, max_wait: int) -> str:
+        """→ 'ok' | 'coalesced' (this run is already waiting or running) | 'timeout'."""
+        key = run_key(agent, task)
+        h = self.holder_info()
+        if (h and run_key(str(h.get("agent")), h.get("task")) == key) or key in self.queued_keys():
+            return "coalesced"
+        self.entry = self.queue / f"{time.time_ns():020d}.{os.getpid()}"
+        self.entry.write_text(json.dumps({"agent": agent, "task": task, "pid": os.getpid(), "at": iso()}, ensure_ascii=False),
+                              encoding="utf-8")
+        deadline = time.time() + max_wait
+        waited_logged = False
+        while True:
+            h = self.holder_info()
+            head = self._entries()[:1]
+            if not h and head and head[0][0] == self.entry:
+                try:
+                    fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.close(fd)
+                except FileExistsError:
+                    pass
+                else:
+                    return "ok"
+            if time.time() > deadline:
+                self.entry.unlink(missing_ok=True)
+                return "timeout"
+            if not waited_logged:
+                waited_logged = True
+                who = run_key(str((h or {}).get("agent", "?")), (h or {}).get("task"))
+                ahead = len(self._entries()) - 1
+                print(f"artel run: slot {self.name} is occupied ({who}); {ahead} ahead in queue; "
+                      f"waiting until {fmt_hm(dt.datetime.fromtimestamp(deadline))}", file=sys.stderr, flush=True)
+            time.sleep(SLOT_POLL_SEC)
+
+    def hold(self, info: dict) -> None:
+        atomic_write(self.holder, json.dumps(info, ensure_ascii=False))
+        if self.entry:
+            self.entry.unlink(missing_ok=True)
+
+    def release(self, force: bool = False) -> None:
+        self.holder.unlink(missing_ok=True)
+        self.lock.unlink(missing_ok=True)
+        if self.entry and not force:
+            self.entry.unlink(missing_ok=True)
+
+    def _record(self, rec: dict) -> None:
+        rec = {"at": iso(), **rec}
+        append_text(self.history, json.dumps(rec, ensure_ascii=False) + "\n")
+
+    record = _record
+
+    def end_stats(self, limit: int = 50) -> dict:
+        """Statistics for recent end history entries: {agent: {n, avg_min, over}}."""
+        if not self.history.exists():
+            return {}
+        ends = []
+        for ln in self.history.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                r = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if r.get("event") == "end":
+                ends.append(r)
+        stats: dict = {}
+        for r in ends[-limit:]:
+            st = stats.setdefault(str(r.get("agent", "?")), {"n": 0, "sum": 0, "over": 0})
+            st["n"] += 1
+            st["sum"] += int(r.get("duration_sec") or 0)
+            st["over"] += 1 if r.get("overran_window") else 0
+        return {k: {"n": v["n"], "avg_min": round(v["sum"] / v["n"] / 60, 1), "over": v["over"]} for k, v in stats.items()}
+
+
+# ── build harness command ──
+
+def norm_effort(e: str | None, harness: str) -> str:
+    e = (e or "medium").lower()
+    if e not in EFFORTS:
+        die(f"effort {e!r} is not one of {EFFORTS}", EXIT_CFG)
+    if harness == "agy" and e in ("xhigh", "max"):
+        return "high"          # agy effort is encoded in the model name: only low|medium|high
+    return e
+
+
+def build_harness_cmd(a_def: dict, prompt: str, cwd: Path, resume: str | None) -> tuple[str, list[str], bool]:
+    """→ (harness, argv, prompt_via_stdin). For claude, the prompt goes to the live session's stdin."""
+    harness = str(a_def.get("harness") or "claude")
+    model = a_def.get("model")
+    effort = norm_effort(a_def.get("effort"), harness)
+    if a_def.get("cmd"):
+        argv = a_def["cmd"] if isinstance(a_def["cmd"], list) else ["bash", "-lc", str(a_def["cmd"])]
+        return harness, [str(x) for x in argv], False
+    if harness == "claude":
+        if a_def.get("remote_control"):
+            argv = ["claude", "--remote-control"]
+            if a_def.get("name"):
+                argv += [str(a_def["name"]), "--name", str(a_def["name"])]
+            argv += ["--dangerously-skip-permissions", "--effort", effort]
+            if model:
+                argv += ["--model", str(model)]
+            if a_def.get("system_prompt_file"):
+                argv += ["--append-system-prompt-file", str(a_def["system_prompt_file"])]
+            if prompt:
+                argv.append(prompt)
+            return harness, argv, False
+        argv = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                "--effort", effort, "--dangerously-skip-permissions"]
+        if model:
+            argv += ["--model", str(model)]
+        if resume:
+            argv += ["--resume", resume]
+        if a_def.get("system_prompt_file"):
+            argv += ["--append-system-prompt-file", str(a_def["system_prompt_file"])]
+        if a_def.get("max_budget_usd"):
+            argv += ["--max-budget-usd", str(a_def["max_budget_usd"])]
+        if a_def.get("max_turns"):   # claude 2.1.3xx removed --max-turns; the limit is now dollars only
+            print("artel run: max_turns is no longer supported by claude; ignoring it; use max_budget_usd", file=sys.stderr)
+        return harness, argv, True
+    if harness == "codex":
+        argv = ["codex", "exec"]
+        if resume:
+            argv += ["resume", resume]
+        argv += ["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox",
+                 "-c", f'model_reasoning_effort="{effort}"']
+        if model:
+            argv += ["-m", str(model)]
+        argv += ["-C", str(cwd), prompt]
+        return harness, argv, False
+    if harness == "agy":
+        argv = ["agy", f"-p={prompt}", "--output-format", "json", "--dangerously-skip-permissions",
+                "--add-dir", str(cwd), "--print-timeout", f"{int(a_def.get('_hard_limit_sec', 7200))}s"]
+        if model:
+            argv += ["--model", str(model)]
+            if not re.search(r"-(low|medium|high)$", str(model)):
+                argv += ["--effort", effort]
+        else:
+            argv += ["--effort", effort]
+        if resume:
+            argv += ["--conversation", resume]
+        return harness, argv, False
+    if harness == "opencode":
+        argv = ["opencode", "run", prompt, "--format", "json", "--auto", "--dir", str(cwd), "--variant", effort]
+        if model:
+            argv += ["-m", str(model)]
+        if a_def.get("agent"):
+            argv += ["--agent", str(a_def["agent"])]
+        if resume:
+            argv += ["--session", resume]
+        return harness, argv, False
+    die(f"unknown harness {harness!r} (claude | codex | agy | opencode)", EXIT_CFG)
+    raise SystemExit
+
+
+def child_env(extra: dict | None) -> dict:
+    env = os.environ.copy()
+    home = Path.home()
+    extra_paths = [str(artel_home() / "bin"), str(home / ".local/bin"), str(home / ".npm-global/bin"),
+                   str(home / ".opencode/bin"), "/usr/local/bin"]
+    env["PATH"] = os.pathsep.join(extra_paths + [env.get("PATH", "")])
+    env["ARTEL_HOME"] = str(artel_home())
+    # harness keys from install/apply-auth.sh: `export KEY='VALUE'` or `KEY=VALUE` lines; do not override existing values
+    auth_env = home / ".config/artel/auth.env"
+    if auth_env.exists():
+        for line in auth_env.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+            if m and m[1] not in env:
+                env[m[1]] = m[2].strip().strip("'").strip('"')
+    env["CI"] = "1"
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    env.setdefault("ENABLE_CLAUDEAI_MCP_SERVERS", "false")
+    for k, v in (extra or {}).items():
+        env[str(k)] = str(v)
+    return env
+
+
+def render_prompt(template: str, subst: dict) -> str:
+    out = template
+    for k, v in subst.items():
+        out = out.replace("{{" + k + "}}", str(v))
+    return out
+
+
+# ── live claude session: stream-json with open stdin; wait for background tasks ──
+
+class ClaudeLive:
+    IDLE_CLOSE_SEC = 90
+
+    def __init__(self, proc, fh, prompt: str):
+        self.proc, self.fh, self.prompt = proc, fh, prompt
+        self.bg = 0
+        self.in_turn = True
+        self.idle_since: float | None = None
+        self.closed = False
+        self.results: list[dict] = []
+        self.session_id: str | None = None
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _w(self, text: str) -> None:
+        try:
+            self.fh.write(text if text.endswith("\n") else text + "\n")
+            self.fh.flush()
+        except ValueError:
+            pass
+
+    def _close(self, why: str) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self._w(f"# session closed: {why}")
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+
+    def _read(self) -> None:
+        msg = {"type": "user", "message": {"role": "user", "content": self.prompt}}
+        try:
+            self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            self.proc.stdin.flush()
+        except OSError as e:
+            self._w(f"# could not send prompt: {e}")
+        for line in self.proc.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                self._w(line.rstrip("\n"))
+                continue
+            self._event(ev)
+        self._w(json.dumps(self.summary(), ensure_ascii=False, separators=(",", ":")))
+
+    def _event(self, ev: dict) -> None:
+        kind, sub = ev.get("type"), ev.get("subtype")
+        if kind == "assistant":
+            self.in_turn, self.idle_since = True, None
+            for block in (ev.get("message") or {}).get("content") or []:
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    self._w("💬 " + block["text"].strip())
+                elif block.get("type") == "tool_use":
+                    inp = block.get("input") or {}
+                    what = inp.get("command") or inp.get("file_path") or inp.get("prompt") or json.dumps(inp, ensure_ascii=False)
+                    bg = " [background]" if inp.get("run_in_background") else ""
+                    self._w(f"→ {block.get('name')}{bg}: " + " ".join(str(what).split())[:300])
+        elif kind == "system" and sub == "init":
+            self.session_id = ev.get("session_id")
+            self._w(f"# session_id: {self.session_id}  model: {ev.get('model')}")
+        elif kind == "system" and sub == "background_tasks_changed":
+            self.bg = len(ev.get("tasks") or [])
+            self._w(f"⏳ background tasks: {self.bg}")
+            if self.bg == 0 and not self.in_turn and self.idle_since is None:
+                self.idle_since = time.time()
+        elif kind == "system" and sub == "task_notification":
+            self._w(f"🔔 background task {ev.get('task_id')}: {ev.get('status')}")
+        elif kind == "result":
+            self.results.append(ev)
+            self.in_turn = False
+            self._w(f"# turn complete: {ev.get('num_turns')} turns, ${ev.get('total_cost_usd') or 0:.2f} total, background tasks {self.bg}"
+                    + (f", error: {ev.get('result')}" if ev.get("is_error") else ""))
+            if self.bg == 0:
+                self._close("work complete; no background tasks")
+            else:
+                self._w(f"# waiting for background tasks ({self.bg}); session remains open")
+
+    def _watch(self) -> None:
+        while self.proc.poll() is None and not self.closed:
+            time.sleep(5)
+            if self.idle_since and time.time() - self.idle_since > self.IDLE_CLOSE_SEC:
+                self._close(f"background tasks finished; no new turn for {self.IDLE_CLOSE_SEC}s")
+
+    def summary(self) -> dict:
+        if not self.results:
+            return {"type": "result", "is_error": True, "result": "session produced no result", "session_mode": "stream"}
+        out = dict(self.results[-1])
+        usage: dict = {}
+        for r in self.results:
+            for k, v in (r.get("usage") or {}).items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    usage[k] = usage.get(k, 0) + v
+        out.update(usage=usage, num_turns=sum(r.get("num_turns") or 0 for r in self.results),
+                   is_error=any(r.get("is_error") for r in self.results[-1:]), session_mode="stream",
+                   turn_results=len(self.results))
+        return out
+
+
+# ── run ──
+
+SIGNALS_FIX_HINT = ("The host AppArmor blocks signals inside the container (Ubuntu 26.04, kernel 7.0): kill, timeout, "
+                    "tmux kill-server, and stopping systemd units do not work. Fix on the host without restarting: "
+                    "incus config set <container> raw.apparmor='signal peer=@{profile_name}//&*,\nptrace "
+                    "peer=@{profile_name}//&*,' (as install/artel-up.sh does)")
+
+
+def signals_ok() -> tuple[bool, str]:
+    """Whether a process can signal its own child. EACCES means a host LSM (AppArmor), not
+    an ordinary uid check; then nobody in the container can kill anything. See SIGNALS_FIX_HINT."""
+    if platform.system() != "Linux":
+        return True, "not checked outside Linux"
+    try:
+        p = subprocess.Popen(["sleep", "5"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        return True, f"not checked ({e})"
+    try:
+        os.kill(p.pid, 0)
+        os.kill(p.pid, signal.SIGKILL)
+        p.wait(timeout=5)
+        return True, "working"
+    except PermissionError:
+        return False, "BLOCKED: " + SIGNALS_FIX_HINT
+    except Exception as e:  # noqa: BLE001
+        return True, f"not checked ({e})"
+
+
+def proc_cmdlines() -> list[tuple[int, list[str]]]:
+    out = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) == os.getpid():
+            continue
+        try:
+            raw = (d / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if raw:
+            out.append((int(d.name), raw.decode("utf-8", "replace").split("\0")[:-1]))
+    return out
+
+
+def remote_control_pids(rc_name: str) -> list[int]:
+    """Live `claude --remote-control <name>` processes (excluding self): a second such process is a second chat
+    with the same name for the user."""
+    pids = []
+    for pid, argv in proc_cmdlines():
+        if "--remote-control" in argv and rc_name in argv and Path(argv[0]).name == "claude":
+            pids.append(pid)
+    return pids
+
+
+def kill_pid_hard(pid: int) -> bool:
+    """SIGTERM, then SIGKILL after 5s; if signals are blocked, try cgroup.kill on its cgroup if it is not ours."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(10):
+            time.sleep(0.5)
+            if not Path(f"/proc/{pid}").exists():
+                return True
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.5)
+        return not Path(f"/proc/{pid}").exists()
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        pass
+    try:
+        theirs = Path(f"/proc/{pid}/cgroup").read_text().strip().split("::", 1)[1]
+        ours = Path("/proc/self/cgroup").read_text().strip().split("::", 1)[1]
+    except (OSError, IndexError):
+        return False
+    if theirs == ours or ours.startswith(theirs.rstrip("/") + "/"):
+        return False
+    try:
+        Path("/sys/fs/cgroup" + theirs + "/cgroup.kill").write_text("1")
+        time.sleep(1)
+        return not Path(f"/proc/{pid}").exists()
+    except OSError:
+        return False
+
+
+def ensure_single_service(ad: Path, name: str, a_def: dict) -> None:
+    """Before starting the concierge, stop its previous remote-control instance with the same name: it can
+    survive a unit restart if signals do not work in the container or the tmux socket changed."""
+    rc_name = str(a_def.get("name") or "") if a_def.get("remote_control") else ""
+    if not rc_name:
+        return
+    stale = remote_control_pids(rc_name)
+    if not stale:
+        return
+    killed = [pid for pid in stale if kill_pid_hard(pid)]
+    left = [pid for pid in stale if pid not in killed]
+    if killed:
+        journal_write(ad, name, "service", f"stopped previous instance {rc_name} before start (pid {', '.join(map(str, killed))}): "
+                      "it survived a unit restart")
+    if left:
+        ok, why = signals_ok()
+        journal_write(ad, name, "problem", f"could not stop previous instance {rc_name} (pid {', '.join(map(str, left))}); "
+                      f"the user will have two chats with this name. Signals: {why}" if not ok else
+                      f"could not stop previous instance {rc_name} (pid {', '.join(map(str, left))}); the user will have two chats with this name")
+
+
+def cgroup_path(unit: str) -> Path | None:
+    rc, so, _ = run_bin(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", unit], timeout=15)
+    cg = so.strip()
+    return Path("/sys/fs/cgroup" + cg) if rc == 0 and cg else None
+
+
+def cgroup_kill(unit: str) -> bool:
+    """Kill the entire scope process tree through cgroup.kill: the kernel does it, so this works even where
+    ordinary kill fails (host AppArmor; see SIGNALS_FIX_HINT). Return True if the unit is gone."""
+    for _ in range(3):
+        p = cgroup_path(unit)
+        if not p:
+            return True
+        try:
+            (p / "cgroup.kill").write_text("1")
+        except OSError:
+            run_bin(["systemctl", "--user", "kill", "-s", "KILL", unit], timeout=15)
+        time.sleep(1)
+    return cgroup_path(unit) is None
+
+
+def scope_wrap(argv: list[str], unit: str) -> list[str]:
+    """Run the harness in its own transient scope so it and all descendants can be stopped at the end
+    (codex/agy workers, emulators, Xvfb). Without systemd, return argv unchanged."""
+    if not shutil.which("systemd-run") or not shutil.which("systemctl"):
+        return argv
+    rc, _, _ = run_bin(["systemctl", "--user", "is-system-running"], timeout=10)
+    if rc is None or rc not in (0, 1):
+        return argv
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--unit", unit, "--", *argv]
+
+
+def kill_group(proc, sig) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def run_prepare(a_def: dict, cwd: Path, env: dict, ad: Path, agent: str) -> tuple[str, str]:
+    """→ (status, stdout). status: 'ok' | 'skip' | 'error'."""
+    script = a_def.get("prepare")
+    if not script:
+        return "ok", ""
+    argv = script if isinstance(script, list) else ["bash", "-lc", str(script)]
+    try:
+        r = subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, text=True,
+                           timeout=parse_duration(str(a_def.get("prepare_timeout", "10m"))))
+    except subprocess.TimeoutExpired:
+        journal_write(ad, agent, "prepare", "prepare script exceeded its timeout; run cancelled")
+        return "error", ""
+    if r.returncode == PREPARE_SKIP_CODE:
+        note = (r.stdout or r.stderr or "").strip()[-500:]
+        journal_write(ad, agent, "skip", "prepare script found no work" + (f": {note}" if note else ""))
+        return "skip", r.stdout or ""
+    if r.returncode != 0:
+        journal_write(ad, agent, "prepare", f"prepare script failed (code {r.returncode}): {(r.stderr or r.stdout).strip()[-500:]}")
+        return "error", ""
+    return "ok", r.stdout or ""
+
+
+def cmd_run(a) -> None:
+    ad = find_ad()
+    data, s = load_cfg(ad)
+    name = a.agent_name
+    raw_def = agent_def(data, name)
+    task = pick_task(raw_def, name, getattr(a, "task", None))
+    a_def = task_def(raw_def, name, task)
+    key = run_key(name, task)
+    project = project_name(ad, s)
+    cwd = expand(a_def.get("cwd") or ad.parent)
+    env = child_env({"ARTEL_AD": str(ad), "ARTEL_AGENT": name, "ARTEL_PROJECT": project, "ARTEL_TASK": task or "",
+                     **(a_def.get("env") or {})})
+    kind = str(a_def.get("kind") or "scheduled")
+
+    # service: no slot or limit; simply become this command (systemd handles its restart)
+    if kind == "service":
+        prompt = render_prompt(str(a_def.get("prompt") or ""), {"AGENT": name, "PROJECT": project, "DATE": human(), "ARTEL_HOME": str(artel_home())})
+        harness, argv, _ = build_harness_cmd(a_def, prompt, cwd, None)
+        if a.dry_run:
+            print(" ".join(shlex_quote(x) for x in argv))
+            return
+        if harness == "claude":
+            claude_accept_dialogs(cwd)
+        ensure_single_service(ad, name, a_def)
+        os.chdir(cwd)
+        os.execvpe(argv[0], argv, env)
+
+    streak_before = int(failures_read(ad).get(name, 0) or 0)
+    if streak_before >= FAILURE_STREAK_PAUSE and name != "super" and not a.force and not a.dry_run:
+        journal_write(ad, name, "skip", f"run skipped: {streak_before} consecutive failures; clear pause: artel run {name} --force")
+        print(f"artel run: {name}: skipped after {streak_before} consecutive failures; clear pause: artel run {name} --force", file=sys.stderr)
+        sys.exit(EXIT_TIMEOUT)
+    if a.force and streak_before:
+        failures_update(ad, name, ok=True)
+        journal_write(ad, name, "unpause", f"failure count ({streak_before}) reset by --force")
+
+    slot_name = a_def.get("slot")
+    slot_spec = slots_cfg(data).get(slot_name) if slot_name else None
+    if slot_name and not isinstance(slot_spec, dict):
+        die(f"agent {name}: slot {slot_name!r} is not defined in config.yaml", EXIT_CFG)
+    window_sec = parse_duration(str(a_def.get("window") or (slot_spec or {}).get("window") or "50m"))
+    hard_sec = parse_duration(str(a_def.get("hard_limit") or (slot_spec or {}).get("hard_limit") or "2h"))
+    max_wait = parse_duration(str(a_def.get("max_wait") or (slot_spec or {}).get("max_wait") or SLOT_MAX_WAIT_DEFAULT))
+    if hard_sec <= window_sec:
+        die(f"agent {name}: hard_limit ({hard_sec}s) must be greater than window ({window_sec}s)", EXIT_CFG)
+    if slot_spec and slot_spec.get("dir") and not a_def.get("cwd"):
+        cwd = expand(slot_spec["dir"])
+    a_def["_hard_limit_sec"] = hard_sec
+
+    status, prep_out = run_prepare(a_def, cwd, env, ad, name)
+    if status == "skip":
+        print(f"artel run: {name}: prepare script cancelled the run")
+        return
+    if status == "error":
+        die(f"{name}: prepare script failed; run cancelled")
+
+    slot = Slot(ad, slot_name, slot_spec) if slot_spec else None
+    queued_at = time.time()
+    if slot:
+        res = slot.acquire(name, task, max_wait)
+        if res == "coalesced":
+            print(f"artel run: {key} is already running or waiting in slot {slot_name}; a second run is unnecessary")
+            return
+        if res == "timeout":
+            slot.record({"event": "wait_timeout", "agent": name, "task": task, "waited_sec": int(time.time() - queued_at)})
+            journal_write(ad, name, "skip", f"slot {slot_name} did not become available within {fmt_dur(max_wait) if max_wait >= 60 else f'{max_wait}s'}"
+                          + (f" (task {task})" if task else "") + "; run dropped")
+            sys.exit(EXIT_TIMEOUT)
+
+    started = time.time()
+    window_end = dt.datetime.fromtimestamp(started + window_sec).astimezone()
+    hard_end = dt.datetime.fromtimestamp(started + hard_sec).astimezone()
+    subst = {"AGENT": name, "TASK": task or "", "PROJECT": project, "DATE": human(), "ARTEL_HOME": str(artel_home()),
+             "SLOT": slot_name or "", "WINDOW_END": fmt_hm(window_end), "BUDGET_MIN": window_sec // 60,
+             "HARD_LIMIT_MIN": hard_sec // 60, "HARD_END": fmt_hm(hard_end), "PREPARE": prep_out.strip()}
+    prompt = render_prompt(str(a_def.get("prompt") or default_prompt(name, task, bool(a_def.get("prepare")))), subst)
+    sessions = state_dir(ad) / "sessions.json"
+    try:
+        sess_map = json.loads(sessions.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        sess_map = {}
+    resume = sess_map.get(name) if a_def.get("session") == "continue" else None
+    harness, argv, via_stdin = build_harness_cmd(a_def, prompt, cwd, resume)
+    scope_unit = f"artel-{project}-{key}-run.scope"
+    if cgroup_path(scope_unit):
+        journal_write(ad, name, "leftovers", f"processes from the previous run remain in {scope_unit}; stopping them before start")
+        cgroup_kill(scope_unit)
+    wrapped = scope_wrap(argv, scope_unit)
+    if a.dry_run:
+        print(f"# agent {name}" + (f" · task {task}" if task else "") + f" · harness {harness} · cwd {cwd} · window until {subst['WINDOW_END']} · limit until {subst['HARD_END']}"
+              + (f" · scope {scope_unit}" if wrapped is not argv else " · no scope (no systemd --user)"))
+        print(" ".join(shlex_quote(x) for x in wrapped))
+        if via_stdin:
+            print("# prompt (stdin):", prompt)
+        if slot:
+            slot.release()
+        return
+
+    logs = state_dir(ad) / "logs" / name
+    logs.mkdir(parents=True, exist_ok=True)
+    logfile = logs / (f"{dt.datetime.now():%Y-%m-%d_%H-%M-%S}" + (f"_{task}" if task else "") + ".log")
+    fh = logfile.open("w", encoding="utf-8")
+    fh.write(f"# {human()} agent={name} task={task or '-'} harness={harness} cwd={cwd} window_end={subst['WINDOW_END']} hard_end={subst['HARD_END']}\n")
+    fh.write("# " + " ".join(shlex_quote(x) for x in argv) + "\n")
+    if via_stdin:
+        fh.write("# prompt (stdin): " + repr(prompt) + "\n")
+    fh.write("\n")
+    fh.flush()
+    if slot:
+        slot.hold({"agent": name, "task": task, "pid": os.getpid(), "since": iso(), "window_end": iso(window_end), "hard_end": iso(hard_end), "log": str(logfile)})
+        slot.record({"event": "start", "agent": name, "task": task, "waited_sec": int(started - queued_at), "window_sec": window_sec, "hard_sec": hard_sec})
+    live = None
+    kill_reason = None
+    proc = None
+    try:
+        if via_stdin:
+            proc = subprocess.Popen(wrapped, cwd=str(cwd), stdout=subprocess.PIPE, stderr=fh, stdin=subprocess.PIPE,
+                                    text=True, bufsize=1, env=env, start_new_session=True)
+            live = ClaudeLive(proc, fh, prompt)
+        else:
+            proc = subprocess.Popen(wrapped, cwd=str(cwd), stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    env=env, start_new_session=True)
+
+        def on_term(_sig, _frm):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, on_term)
+        try:
+            proc.wait(timeout=hard_sec)
+        except subprocess.TimeoutExpired:
+            kill_reason = f"hard limit {hard_sec // 60}m"
+        except KeyboardInterrupt:
+            kill_reason = "stopped externally (SIGTERM)"
+        if kill_reason:
+            kill_group(proc, signal.SIGTERM)
+            try:
+                proc.wait(timeout=TERM_GRACE_SEC)
+            except subprocess.TimeoutExpired:
+                kill_group(proc, signal.SIGKILL)
+                proc.wait()
+        if live:
+            live.reader.join(15)
+    finally:
+        fh.close()
+        if wrapped is not argv and cgroup_path(scope_unit):
+            leftovers = []
+            try:
+                leftovers = (cgroup_path(scope_unit) / "cgroup.procs").read_text().split()
+            except OSError:
+                pass
+            if leftovers:
+                journal_write(ad, name, "leftovers", f"processes remain in the scope after harness exit ({len(leftovers)}): stopping them via cgroup.kill")
+            cgroup_kill(scope_unit)
+        if slot:
+            slot.release()
+    dur_min = (time.time() - started) / 60
+    text = logfile.read_text(encoding="utf-8", errors="replace")
+    m = SESSION_RE.search(text)
+    sid = (live.session_id if live else None) or (m.group(1) if m else None)
+    if sid:
+        sess_map[name] = sid
+        atomic_write(sessions, json.dumps(sess_map, ensure_ascii=False, indent=1))
+    if proc is None:
+        if slot:
+            slot.record({"event": "end", "agent": name, "task": task, "outcome": "error", "duration_sec": 0})
+        die(f"{name}: could not start {harness} ({argv[0]}): command not found or not runnable; see {logfile}")
+    rc = proc.returncode
+    outcome = "killed" if kill_reason else ("ok" if rc == 0 else "error")
+    if slot:
+        slot.record({"event": "end", "agent": name, "task": task, "outcome": outcome, "duration_sec": int(dur_min * 60),
+                     "overran_window": dur_min * 60 > window_sec, "rc": rc, "kill_reason": kill_reason, "log": str(logfile)})
+    streak = failures_update(ad, name, ok=(outcome == "ok"))
+    if kill_reason:
+        journal_write(ad, name, "killed", f"{kill_reason}; ran for {dur_min:.0f}m with a {window_sec // 60}m window. Log: {logfile}")
+        summary_file = ad / "team" / name / "SUMMARY.md"
+        if summary_file.exists():
+            append_text(summary_file, f"\n## {human()} · failed · system\nRun killed: {kill_reason}. Unfinished work may remain in the working tree; "
+                                      f"the next run starts by checking state. Log: {logfile}\n")
+        alert_run_failure(ad, s, name, a_def, harness, outcome, kill_reason, logfile, streak)
+    elif rc != 0:
+        journal_write(ad, name, "run error", f"harness {harness} exited with code {rc} after {dur_min:.0f}m. Log: {logfile}")
+        tail = "\n".join(ln for ln in text.splitlines()[-60:] if not ln.startswith("#"))
+        if dur_min < 5 and looks_like_auth_problem(tail):
+            alert_auth_failure(ad, s, name, harness, logfile, tail)
+        else:
+            alert_run_failure(ad, s, name, a_def, harness, outcome, f"code {rc} after {dur_min:.0f}m", logfile, streak)
+    commit_res = team_commit(ad, s, f"artel: {key} run {human()} · {outcome}")
+    if commit_res.startswith("error"):
+        journal_write(ad, name, "problem", f"user project directory commit failed: {commit_res}")
+    print(f"artel run: {key} · {outcome} · {dur_min:.1f}m · log {logfile}" + (f" · git {commit_res}" if commit_res != "disabled" else ""))
+    if outcome != "ok":
+        sys.exit(1 if outcome == "error" else EXIT_TIMEOUT)
+
+
+def claude_accept_dialogs(cwd: Path) -> None:
+    """Interactive claude in tmux without a person gets stuck on “trust this folder?” and
+    “accept --dangerously-skip-permissions?” dialogs. Mark them accepted in ~/.claude.json beforehand."""
+    p = Path.home() / ".claude.json"
+    try:
+        d = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        d = {}
+    changed = False
+    if not d.get("bypassPermissionsModeAccepted"):
+        d["bypassPermissionsModeAccepted"] = True
+        changed = True
+    projects = d.setdefault("projects", {})
+    proj = projects.setdefault(str(cwd), {})
+    if not proj.get("hasTrustDialogAccepted"):
+        proj["hasTrustDialogAccepted"] = True
+        changed = True
+    if changed:
+        atomic_write(p, json.dumps(d, ensure_ascii=False, indent=2))
+
+
+def shlex_quote(x: str) -> str:
+    import shlex
+    return shlex.quote(x)
+
+
+# ── schedule → OnCalendar ──
+
+DAY_MAP = {"mon": "Mon", "tue": "Tue", "wed": "Wed", "thu": "Thu", "fri": "Fri", "sat": "Sat", "sun": "Sun",
+           "\u043f\u043d": "Mon", "\u0432\u0442": "Tue", "\u0441\u0440": "Wed", "\u0447\u0442": "Thu", "\u043f\u0442": "Fri", "\u0441\u0431": "Sat", "\u0432\u0441": "Sun",
+           "\u0431\u0443\u0434\u043d\u0438": "Mon..Fri", "\u0432\u044b\u0445\u043e\u0434\u043d\u044b\u0435": "Sat,Sun",
+           "weekdays": "Mon..Fri", "weekend": "Sat,Sun"}
+
+
+def days_expr(days) -> str:
+    if days in (None, "", "*", "daily", "\u0435\u0436\u0435\u0434\u043d\u0435\u0432\u043d\u043e"):
+        return ""
+    if isinstance(days, list):
+        days = ",".join(str(d) for d in days)
+    out = []
+    for part in str(days).split(","):
+        part = part.strip().lower()
+        if ".." in part:
+            a, b = part.split("..", 1)
+            out.append(f"{DAY_MAP.get(a.strip(), a.strip().title())}..{DAY_MAP.get(b.strip(), b.strip().title())}")
+        else:
+            out.append(DAY_MAP.get(part, part.title()))
+    return ",".join(out)
+
+
+def schedule_minutes(sch: dict) -> list[int]:
+    """Minutes of the day at which the {from, to, every} mapping triggers."""
+    every = parse_duration(str(sch.get("every") or "1h"))
+    frm = str(sch.get("from") or "00:00")
+    to = str(sch.get("to") or "23:59")
+    fh, fm = (int(x) for x in frm.split(":"))
+    th, tm = (int(x) for x in to.split(":"))
+    start, end = fh * 60 + fm, th * 60 + tm
+    if every < 60 or every % 60:
+        die("every must be a whole number of minutes and at least one minute", EXIT_CFG)
+    step = every // 60
+    mins: list[int] = []
+    t = start
+    while t < start + 24 * 60:
+        m = t % (24 * 60)
+        inside = (start <= m <= end) if start <= end else (m >= start or m <= end)
+        if not inside:
+            break
+        mins.append(m)
+        t += step
+    if not mins:
+        die(f"schedule {sch!r} produces no times", EXIT_CFG)
+    return mins
+
+
+def schedule_to_calendar(sch) -> list[str]:
+    """Schedule from config.yaml → OnCalendar strings. A string is used as-is (it is already OnCalendar);
+    {days, from, to, every} is expanded into times."""
+    if isinstance(sch, str):
+        return [sch]
+    if isinstance(sch, list):
+        return [str(x) for x in sch]
+    if not isinstance(sch, dict):
+        die(f"schedule must be an OnCalendar string or a days/from/to/every mapping; got {sch!r}", EXIT_CFG)
+    d = days_expr(sch.get("days"))
+    prefix = f"{d} *-*-* " if d else "*-*-* "
+    if "at" in sch:  # one time per day, for example at: "00:00"
+        times = sch["at"] if isinstance(sch["at"], list) else [sch["at"]]
+        return [f"{prefix}{t}:00" for t in times]
+    mins = schedule_minutes(sch)
+    by_minute: dict[int, list[int]] = {}
+    for m in mins:
+        by_minute.setdefault(m % 60, []).append(m // 60)
+    out = []
+    for mm, hs in sorted(by_minute.items()):
+        hs = sorted(set(hs))
+        contiguous = hs == list(range(hs[0], hs[-1] + 1))
+        hpart = f"{hs[0]:02d}..{hs[-1]:02d}" if contiguous and len(hs) > 1 else ",".join(f"{h:02d}" for h in hs)
+        out.append(f"{prefix}{hpart}:{mm:02d}:00")
+    return out
+
+
+def calendar_check(expr: str, n: int = 3) -> list[str]:
+    """`systemd-analyze calendar` → next triggers (empty if systemd is unavailable)."""
+    if not shutil.which("systemd-analyze"):
+        return []
+    rc, so, se = run_bin(["systemd-analyze", "calendar", f"--iterations={n}", expr], timeout=20)
+    if rc != 0:
+        die(f"systemd rejected OnCalendar {expr!r}: {(se or so).strip()[-200:]}", EXIT_CFG)
+    return [ln.split(":", 1)[1].strip() for ln in so.splitlines() if ln.strip().startswith(("Next elapse", "Iteration", "Iter."))][:n]
+
+
+def schedule_human(sch) -> str:
+    """Schedule in words for tables: “at 09:00 daily”, “every 2h from 01:00 to 23:00 (mon..fri)”."""
+    if isinstance(sch, dict):
+        d = sch.get("days")
+        days = "" if d in (None, "", "*", "daily") else f" ({', '.join(map(str, d)) if isinstance(d, list) else d})"
+        if "at" in sch:
+            at = sch["at"] if isinstance(sch["at"], list) else [sch["at"]]
+            return "at " + ", ".join(map(str, at)) + (days or " daily")
+        return f"every {sch.get('every', '1h')} from {sch.get('from', '00:00')} to {sch.get('to', '23:59')}{days}"
+    if isinstance(sch, list):
+        return " | ".join(map(str, sch))
+    return str(sch)
+
+
+def runs_per_day(sch) -> int | None:
+    """How many triggers per day the schedule produces (on a day when it is active). Mappings are counted exactly;
+    OnCalendar strings via systemd-analyze; None when it cannot be calculated."""
+    if isinstance(sch, dict):
+        if "at" in sch:
+            return len(sch["at"]) if isinstance(sch["at"], list) else 1
+        return len(schedule_minutes(sch))
+    if not shutil.which("systemd-analyze"):
+        return None
+    total = 0
+    for c in schedule_to_calendar(sch):
+        rc, so, _ = run_bin(["systemd-analyze", "calendar", "--iterations=120", c], timeout=20)
+        if rc != 0:
+            return None
+        by_day: dict[str, int] = {}
+        for ln in so.splitlines():
+            if ln.strip().startswith(("Next elapse", "Iteration", "Iter.")):
+                m = re.search(r"(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}", ln)
+                if m:
+                    by_day[m[1]] = by_day.get(m[1], 0) + 1
+        if not by_day:
+            return None
+        days = list(by_day.values())
+        total += max(days[1:-1]) if len(days) >= 3 else max(days)   # first and last days may be incomplete
+    return total
+
+
+def fmt_dur(sec: int) -> str:
+    h, m = divmod(int(sec) // 60, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+# ── generate systemd --user units ──
+
+def unit_base(project: str, agent: str, task: str | None = None) -> str:
+    return f"artel-{project}-{agent}" + (f".{task}" if task else "")
+
+
+def render_units(ad: Path, slots: dict, project: str, name: str, a_def: dict) -> dict[str, str]:
+    kind = str(a_def.get("kind") or "scheduled")
+    base = unit_base(project, name)
+    artel_bin = Path(__file__).resolve()   # absolute path in ARTEL_HOME/bin: units do not depend on PATH
+    workdir = expand(a_def.get("cwd") or ad.parent)
+    env_lines = "".join(f'Environment="{k}={v}"\n' for k, v in (a_def.get("env") or {}).items())
+    units: dict[str, str] = {}
+    if kind == "service":
+        units[f"{base}.service"] = f"""[Unit]
+Description=artel {project}: {name} service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+WorkingDirectory={workdir}
+Environment=ARTEL_AD={ad}
+Environment=ARTEL_AGENT={name}
+Environment=TERM=xterm-256color
+{env_lines}ExecStartPre=-/usr/bin/tmux -L {base} kill-server
+ExecStart=/usr/bin/tmux -L {base} new-session -d -s {base} -c {workdir} '{artel_bin} run {name}'
+ExecStop=/usr/bin/tmux -L {base} kill-server
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=60
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
+"""
+        return units
+    slot_spec = (slots.get(a_def.get("slot")) if a_def.get("slot") else None) or {}
+    for task, d in agent_variants(name, a_def):
+        base = unit_base(project, name, task)
+        label = run_key(name, task)
+        env_lines = "".join(f'Environment="{k}={v}"\n' for k, v in (d.get("env") or {}).items())
+        window_sec = parse_duration(str(d.get("window") or slot_spec.get("window") or "50m"))
+        hard_sec = parse_duration(str(d.get("hard_limit") or slot_spec.get("hard_limit") or "2h"))
+        max_wait = parse_duration(str(d.get("max_wait") or slot_spec.get("max_wait") or SLOT_MAX_WAIT_DEFAULT))
+        backstop = max_wait + hard_sec + parse_duration(str(d.get("prepare_timeout", "10m"))) + 120
+        task_arg = f" --task {task}" if task else ""
+        units[f"{base}.service"] = f"""[Unit]
+Description=artel {project}: {label} agent
+
+[Service]
+Type=oneshot
+WorkingDirectory={workdir}
+Environment=ARTEL_AD={ad}
+Environment=ARTEL_AGENT={name}
+{env_lines}ExecStart={artel_bin} run {name}{task_arg}
+TimeoutStartSec={backstop}
+KillMode=control-group
+TimeoutStopSec={TERM_GRACE_SEC + 15}
+"""
+        cal = schedule_to_calendar(d.get("schedule") or {"every": "1h"})
+        cal_lines = "".join(f"OnCalendar={c}\n" for c in cal)
+        units[f"{base}.timer"] = f"""[Unit]
+Description=artel {project}: {label} agent schedule
+
+[Timer]
+{cal_lines}AccuracySec=30s
+Persistent=false
+Unit={base}.service
+
+[Install]
+WantedBy=timers.target
+"""
+    return units
+
+
+def render_quota_units(ad: Path, project: str) -> dict[str, str]:
+    """Timer that keeps agents/state/quota.json fresh so `artel quota` responds instantly for agents."""
+    base = f"artel-{project}-quota"
+    artel_bin = Path(__file__).resolve()
+    return {f"{base}.service": f"""[Unit]
+Description=artel {project}: refresh quota cache
+
+[Service]
+Type=oneshot
+WorkingDirectory={ad.parent}
+Environment=ARTEL_AD={ad}
+ExecStart={artel_bin} quota --fresh --quiet
+TimeoutStartSec=180
+""", f"{base}.timer": f"""[Unit]
+Description=artel {project}: quota cache refresh schedule
+
+[Timer]
+OnCalendar={QUOTA_TIMER_CALENDAR}
+OnStartupSec=2m
+AccuracySec=1m
+Persistent=false
+Unit={base}.service
+
+[Install]
+WantedBy=timers.target
+"""}
+
+
+def systemctl_user(*args: str, check: bool = True) -> str:
+    rc, so, se = run_bin(["systemctl", "--user", *args], timeout=60)
+    if check and rc != 0:
+        die(f"systemctl --user {' '.join(args)}: {(se or so).strip()[-300:]}")
+    return so
+
+
+def cmd_register(a) -> None:
+    ad = find_ad()
+    data, s = load_cfg(ad)
+    project = project_name(ad, s)
+    agents = agents_cfg(data)
+    slots = slots_cfg(data)
+    if not agents:
+        die("config.yaml has no agents section", EXIT_CFG)
+    for sl_name, sl in slots.items():
+        w, h = parse_duration(str(sl.get("window", "50m"))), parse_duration(str(sl.get("hard_limit", "2h")))
+        if h <= w:
+            die(f"slot {sl_name}: hard_limit must be greater than window", EXIT_CFG)
+    unit_dir = expand("~/.config/systemd/user")
+    all_units: dict[str, str] = {}
+    report: list[str] = []
+    for name, a_def in agents.items():
+        if not isinstance(a_def, dict):
+            die(f"agent {name}: definition must be a mapping", EXIT_CFG)
+        if a_def.get("enabled") is False:
+            report.append(f"- {name}: disabled (enabled: false); units will not be created")
+            continue
+        units = render_units(ad, slots, project, name, a_def)
+        all_units.update(units)
+        kind = str(a_def.get("kind") or "scheduled")
+        if kind == "service":
+            report.append(f"- {name}: service (tmux, restart on failure)")
+        else:
+            for task, d in agent_variants(name, a_def):
+                cal = schedule_to_calendar(d.get("schedule") or {"every": "1h"})
+                nxt = []
+                for c in cal:
+                    nxt += calendar_check(c, 2)
+                shown_task = d.get("_task")
+                report.append(f"- {run_key(name, task)}: slot {a_def.get('slot') or 'none'}"
+                              + (f" · task {shown_task}" if shown_task and not task else "")
+                              + f" · OnCalendar {' | '.join(cal)}" + (f" · next: {'; '.join(nxt[:3])}" if nxt else ""))
+    all_units.update(render_quota_units(ad, project))
+    report.append(f"- quota: quota snapshot cache refreshed by OnCalendar {QUOTA_TIMER_CALENDAR} (agents/state/quota.json)")
+    report += [f"- NOTE: {n}" for n in schedule_notes(ad, agents, slots)]
+    prefix = f"artel-{project}-"
+    existing = sorted(p.name for p in unit_dir.glob(f"{prefix}*") if p.is_file() and p.suffix in (".service", ".timer")) if unit_dir.exists() else []
+    stale = [u for u in existing if u not in all_units]
+    print(f"# artel register · project {project} · {len(all_units)} units in {unit_dir}")
+    print("\n".join(report))
+    if stale:
+        print("- stale units (will be disabled and removed with --apply): " + ", ".join(stale))
+    if a.print_units:
+        for fn, text in all_units.items():
+            print(f"\n### {fn}\n{text}")
+    if not a.apply:
+        print("\n(dry run; add --apply to write units and enable timers)")
+        return
+    if not shutil.which("systemctl"):
+        die("systemctl not found: register works only where systemd --user is available")
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    for u in stale:
+        systemctl_user("disable", "--now", u, check=False)
+        (unit_dir / u).unlink(missing_ok=True)
+    changed = []
+    for fn, text in all_units.items():
+        try:
+            before = (unit_dir / fn).read_text(encoding="utf-8")
+        except OSError:
+            before = None
+        if before != text:
+            changed.append(fn)
+        atomic_write(unit_dir / fn, text)
+    systemctl_user("daemon-reload")
+    restarted = []
+    for fn in all_units:
+        if fn.endswith(".timer") or (fn.endswith(".service") and fn[:-8] + ".timer" not in all_units):
+            systemctl_user("enable", "--now", fn)
+            if fn.endswith(".service") and fn in changed:
+                systemctl_user("restart", fn, check=False)   # long-running service needs a restart with the new unit
+                restarted.append(fn)
+    journal_write(ad, agent_name(a), "register", f"systemd units updated: {', '.join(sorted(all_units))}"
+                  + (f"; removed: {', '.join(stale)}" if stale else ""))
+    if restarted:
+        print("services with changed units restarted: " + ", ".join(restarted))
+    ok, why = signals_ok()
+    if not ok:
+        print(f"WARNING: inter-process signals {why}")
+        journal_write(ad, agent_name(a), "problem", f"inter-process signals {why}")
+    for name, a_def in agents.items():
+        rc_name = str(a_def.get("name") or "") if a_def.get("remote_control") and str(a_def.get("kind")) == "service" else ""
+        if not rc_name or a_def.get("enabled") is False:
+            continue
+        time.sleep(3)
+        n = len(remote_control_pids(rc_name))
+        if n != 1:
+            print(f"WARNING: claude --remote-control {rc_name} processes: {n} (must be exactly one); "
+                  f"see journalctl --user -u {unit_base(project, name)}")
+    print("\nenabled. Check: systemctl --user list-timers 'artel-*' ; run journal: journalctl --user -u <unit> -f")
+
+
+def cmd_unregister(a) -> None:
+    ad = find_ad()
+    _, s = load_cfg(ad)
+    project = project_name(ad, s)
+    unit_dir = expand("~/.config/systemd/user")
+    units = sorted(p.name for p in unit_dir.glob(f"artel-{project}-*") if p.is_file() and p.suffix in (".service", ".timer")) if unit_dir.exists() else []
+    if not units:
+        print("this project has no units")
+        return
+    for u in units:
+        systemctl_user("disable", "--now", u, check=False)
+        (unit_dir / u).unlink(missing_ok=True)
+    systemctl_user("daemon-reload", check=False)
+    journal_write(ad, agent_name(a), "unregister", f"units removed: {', '.join(units)}")
+    print("removed: " + ", ".join(units))
+
+
+def cmd_slot(a) -> None:
+    ad = find_ad()
+    data, _ = load_cfg(ad)
+    slots = slots_cfg(data)
+    names = [a.slot_name] if a.slot_name else list(slots)
+    if a.slot_name and a.slot_name not in slots:
+        die(f"slot {a.slot_name!r} is not defined", EXIT_CFG)
+    for n in names:
+        sl = Slot(ad, n, slots[n])
+        h = sl.holder_info()
+        q = sl.queued_keys()
+        print(f"## slot {n} · {slots[n].get('sphere', '')}".rstrip(" ·"))
+        print(f"- window {slots[n].get('window', '50m')} · limit {slots[n].get('hard_limit', '2h')} · queue wait up to "
+              f"{slots[n].get('max_wait', SLOT_MAX_WAIT_DEFAULT)} · directory {slots[n].get('dir', ad.parent)}")
+        if h:
+            print(f"- occupied: {run_key(str(h.get('agent')), h.get('task'))} since {h.get('since', '?')[11:16]}, window until {str(h.get('window_end', ''))[11:16]}, limit until {str(h.get('hard_end', ''))[11:16]}")
+        else:
+            print("- free")
+        print(f"- queue: {', '.join(q) if q else 'empty'}")
+        if a.history and sl.history.exists():
+            lines = sl.history.read_text(encoding="utf-8").splitlines()[-a.history:]
+            print("- history:")
+            for ln in lines:
+                try:
+                    r = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                extra = {k: v for k, v in r.items() if k not in ("at", "event", "agent", "task", "log")}
+                print(f"    {r.get('at', '')[5:16]} {r.get('event')} {run_key(str(r.get('agent', '')), r.get('task'))} {json.dumps(extra, ensure_ascii=False) if extra else ''}")
+
+
+# ── project schedule: slots, agents, timers, notes ──
+
+def timer_state(unit: str) -> dict | None:
+    """systemd --user timer state: {LoadState, ActiveState, NextElapseUSecRealtime, LastTriggerUSec}; None without systemd."""
+    if not shutil.which("systemctl"):
+        return None
+    rc, so, _ = run_bin(["systemctl", "--user", "show", f"{unit}.timer", "-p", "LoadState", "-p", "ActiveState",
+                         "-p", "NextElapseUSecRealtime", "-p", "LastTriggerUSec"], timeout=15)
+    if rc != 0:
+        return None
+    return dict(ln.split("=", 1) for ln in so.splitlines() if "=" in ln)
+
+
+def schedule_rows(ad: Path, agents: dict, slots: dict, project: str, live: bool = True) -> list[dict]:
+    """One row for each timer run (agent or agent.task) and each service."""
+    failures = failures_read(ad)
+    rows: list[dict] = []
+    for name, a_def in agents.items():
+        if not isinstance(a_def, dict):
+            continue
+        kind = str(a_def.get("kind") or "scheduled")
+        common = {"agent": name, "kind": kind, "harness": str(a_def.get("harness") or "claude"), "model": a_def.get("model"),
+                  "effort": a_def.get("effort") or "medium", "enabled": a_def.get("enabled") is not False,
+                  "paused": int(failures.get(name, 0) or 0) >= FAILURE_STREAK_PAUSE and name != "super",
+                  "failures": int(failures.get(name, 0) or 0)}
+        if kind == "service":
+            rows.append({**common, "key": name, "task": None, "slot": None, "unit": unit_base(project, name)})
+            continue
+        slot_spec = (slots.get(a_def.get("slot")) if a_def.get("slot") else None) or {}
+        variants = agent_variants(name, a_def) if common["enabled"] else []
+        if not variants and not common["enabled"]:
+            variants = [(None, task_def(a_def, name, None))]
+        for task, d in variants:
+            sch = d.get("schedule") or {"every": "1h"}
+            window_sec = parse_duration(str(d.get("window") or slot_spec.get("window") or "50m"))
+            hard_sec = parse_duration(str(d.get("hard_limit") or slot_spec.get("hard_limit") or "2h"))
+            max_wait = parse_duration(str(d.get("max_wait") or slot_spec.get("max_wait") or SLOT_MAX_WAIT_DEFAULT))
+            row = {**common, "key": run_key(name, task), "task": d.get("_task"), "slot": a_def.get("slot"),
+                   "schedule": sch, "schedule_text": schedule_human(sch), "calendar": schedule_to_calendar(sch),
+                   "runs_per_day": runs_per_day(sch) if common["enabled"] else 0, "window_sec": window_sec,
+                   "hard_sec": hard_sec, "max_wait_sec": max_wait, "prepare": bool(d.get("prepare")),
+                   "unit": unit_base(project, name, task), "timer": None}
+            if live and common["enabled"]:
+                row["timer"] = timer_state(row["unit"])
+            rows.append(row)
+    return rows
+
+
+def schedule_notes(ad: Path, agents: dict, slots: dict) -> list[str]:
+    """Structural notes for register and schedule: one slot for everyone, overload, max_wait below the limit, pauses."""
+    notes: list[str] = []
+    rows = schedule_rows(ad, agents, slots, "x", live=False)
+    sched = [r for r in rows if r["kind"] != "service" and r["enabled"]]
+    by_slot: dict[str, list[dict]] = {}
+    for r in sched:
+        by_slot.setdefault(str(r["slot"] or ""), []).append(r)
+    used = [s for s in by_slot if s]
+    agents_in = {s: sorted({r["agent"] for r in rs}) for s, rs in by_slot.items() if s}
+    if len(used) == 1 and len(agents_in[used[0]]) >= 3:
+        notes.append(f"all {len(agents_in[used[0]])} scheduled agents ({', '.join(agents_in[used[0]])}) share one slot "
+                     f"{used[0]} and work strictly in sequence. A slot is a lane of parallelism: spread agents that do not write the same "
+                     f"files across different slots (each with its own dir or worktree in scratch/) so they can run concurrently")
+    for s, rs in by_slot.items():
+        if not s:
+            continue
+        spec = slots.get(s) or {}
+        total = sum((r["runs_per_day"] or 0) * r["window_sec"] for r in rs)
+        if total > 24 * 3600:
+            notes.append(f"slot {s}: run windows total {fmt_dur(total)} per day, over 24 hours: the queue will grow, "
+                         f"runs will wait or be dropped by max_wait; spread agents across slots or shorten windows")
+        w = parse_duration(str(spec.get("window", "50m")))
+        h = parse_duration(str(spec.get("hard_limit", "2h")))
+        mw = parse_duration(str(spec.get("max_wait") or SLOT_MAX_WAIT_DEFAULT))
+        if mw < h:
+            notes.append(f"slot {s}: max_wait {spec.get('max_wait')} is below hard_limit {spec.get('hard_limit', '2h')}: a waiting agent "
+                         f"will leave the queue before the holder must exit; remove max_wait (default {SLOT_MAX_WAIT_DEFAULT}) "
+                         f"or set it to at least the limit")
+        if h <= w:
+            notes.append(f"slot {s}: hard_limit must be greater than window")
+    unused = [s for s in slots if s not in used]
+    if unused and used:
+        notes.append(f"slots without agents: {', '.join(unused)}")
+    paused = sorted({r["agent"] for r in rows if r["paused"]})
+    if paused:
+        notes.append(f"paused after {FAILURE_STREAK_PAUSE} consecutive failures: {', '.join(paused)} (clear: artel run <agent> --force)")
+    return notes
+
+
+def cmd_schedule(a) -> None:
+    ad = find_ad()
+    data, s = load_cfg(ad)
+    project = project_name(ad, s)
+    agents, slots = agents_cfg(data), slots_cfg(data)
+    rows = schedule_rows(ad, agents, slots, project, live=not a.no_systemd)
+    notes = schedule_notes(ad, agents, slots)
+    slot_views = []
+    for sn, spec in slots.items():
+        sl = Slot(ad, sn, spec)
+        h = sl.holder_info()
+        rs = [r for r in rows if r.get("slot") == sn and r["enabled"]]
+        total = sum((r["runs_per_day"] or 0) * r["window_sec"] for r in rs)
+        slot_views.append({"name": sn, "dir": str(spec.get("dir", ad.parent)), "sphere": spec.get("sphere", ""),
+                           "window": spec.get("window", "50m"), "hard_limit": spec.get("hard_limit", "2h"),
+                           "max_wait": spec.get("max_wait", SLOT_MAX_WAIT_DEFAULT), "runs": rs,
+                           "runs_per_day": sum(r["runs_per_day"] or 0 for r in rs), "window_total_sec": total,
+                           "holder": h, "queue": sl.queued_keys(), "stats": sl.end_stats()})
+    if a.json:
+        out = {"project": project, "at": iso(), "slots": [{k: v for k, v in sv.items() if k != "runs"} | {"runs": [r["key"] for r in sv["runs"]]}
+                                                         for sv in slot_views], "agents": rows, "notes": notes}
+        print(json.dumps(out, ensure_ascii=False, indent=1, default=str))
+        return
+    print(f"# Schedule · project {project} · {human()}")
+    print("\n## Slots")
+    if not slot_views:
+        print("no slots: agents run without a queue")
+    for sv in slot_views:
+        print(f"\n### {sv['name']}" + (f" · {sv['sphere']}" if sv["sphere"] else ""))
+        print(f"- directory {sv['dir']} · window {sv['window']} · limit {sv['hard_limit']} · queue wait up to {sv['max_wait']}")
+        if sv["runs"]:
+            parts = [f"{r['key']} ({r['runs_per_day'] if r['runs_per_day'] is not None else '?'}/day)" for r in sv["runs"]]
+            share = sv["window_total_sec"] / (24 * 3600) * 100
+            print(f"- runs: {', '.join(parts)}: {sv['runs_per_day']} per day, windows totaling {fmt_dur(sv['window_total_sec'])} of 24h ({share:.0f}%)")
+        else:
+            print("- runs: no agents in this slot")
+        if sv["stats"]:
+            st = ", ".join(f"{k} {v['avg_min']}m × {v['n']}" + (f", per window {v['over']}" if v["over"] else "") for k, v in sv["stats"].items())
+            print(f"- history (recent runs): average duration {st}; slot is released immediately on completion, not at window end")
+        now_line = ("occupied: " + run_key(str(sv["holder"].get("agent")), sv["holder"].get("task")) + f" since {str(sv['holder'].get('since', ''))[11:16]}"
+                    if sv["holder"] else "free")
+        print(f"- now: {now_line} · queue: {', '.join(sv['queue']) if sv['queue'] else 'empty'}")
+    print("\n## Agents")
+    print("| run | state | harness · model · effort | slot | schedule | per day | window / limit | timer: next · last |")
+    print("|---|---|---|---|---|---|---|---|")
+    for r in rows:
+        state = "disabled" if not r["enabled"] else ("paused" if r["paused"] else "on")
+        hm = f"{r['harness']} · {r.get('model') or '?'} · {r['effort']}"
+        if r["kind"] == "service":
+            st = ""
+            if not a.no_systemd and shutil.which("systemctl") and r["enabled"]:
+                rc, so, _ = run_bin(["systemctl", "--user", "show", f"{r['unit']}.service", "-p", "ActiveState", "-p", "LoadState"], timeout=15)
+                d = dict(ln.split("=", 1) for ln in so.splitlines() if "=" in ln) if rc == 0 else {}
+                st = "not registered" if d.get("LoadState") == "not-found" else d.get("ActiveState", "")
+            print(f"| {r['key']} | {state} | {hm} | service | always | | | {st} |")
+            continue
+        tm = r.get("timer")
+        if tm is None:
+            tcol = "" if a.no_systemd else "not registered" if r["enabled"] else ""
+        elif tm.get("LoadState") == "not-found":
+            tcol = "not registered"
+        else:
+            nxt = (tm.get("NextElapseUSecRealtime") or "n/a").replace(" CET", "").replace(" CEST", "")
+            last = (tm.get("LastTriggerUSec") or "n/a").replace(" CET", "").replace(" CEST", "")
+            tcol = f"{tm.get('ActiveState', '')} · {nxt[4:20]} · {last[4:20]}"
+        prep = " · prepare" if r["prepare"] else ""
+        rpd = r["runs_per_day"] if r["runs_per_day"] is not None else "?"
+        print(f"| {r['key']} | {state} | {hm} | {r['slot'] or 'no slot'} | {r['schedule_text']}{prep} | {rpd} | "
+              f"{r['window_sec'] // 60}m / {r['hard_sec'] // 60}m | {tcol} |")
+    if notes:
+        print("\n## Notes")
+        for n in notes:
+            print(f"- {n}")
+    print("\nDetails: `artel slot --history 20` (slot queue and history), `artel run <agent> [--task name] --dry-run` (run command), "
+          "`systemctl --user list-timers 'artel-*'`.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="artel", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("env", help="environment overview")
+    sp.set_defaults(fn=cmd_env)
+
+    sp = sub.add_parser("quota", help="quota snapshot (cache under 10 min old by default, otherwise poll for up to a minute)")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--fresh", action="store_true", help="poll again; do not use the cache")
+    sp.add_argument("--cached", action="store_true", help="use the cache regardless of age (poll if absent)")
+    sp.add_argument("--quiet", action="store_true", help="print nothing; only refresh the cache (for the timer)")
+    sp.add_argument("--codex-home", default=None)
+    sp.add_argument("--only", default=None, help="only these comma-separated harnesses: codex,claude,agy,opencode")
+    sp.add_argument("--days", type=int, default=7, help="opencode model usage window, in days (default 7)")
+    sp.add_argument("--no-agy", action="store_true", help="do not poll agy")
+    sp.add_argument("--no-opencode", action="store_true", help="do not poll opencode")
+    sp.set_defaults(fn=cmd_quota)
+
+    for name, fn, hlp in (("notify", cmd_notify, "message without waiting for a reply"), ("ask", cmd_ask, "question with reply wait")):
+        sp = sub.add_parser(name, help=hlp)
+        sp.add_argument("text", nargs="?", help="text or - for stdin")
+        sp.add_argument("--title")
+        sp.add_argument("--via", choices=["auto", "claude", "telegram"])
+        sp.add_argument("--agent")
+        sp.add_argument("--urgent", action="store_true", help="ignore quiet hours")
+        if name == "ask":
+            sp.add_argument("--timeout", help="for example 5m, 300s; default 300s")
+            sp.add_argument("--options", help="reply options separated by |")
+            sp.add_argument("--default", help="what to do if there is no reply")
+            sp.add_argument("--any-reply", action="store_true", help="telegram: accept any message after the question, not only a reply or tag")
+        sp.set_defaults(fn=fn)
+
+    sp = sub.add_parser("channel", help="concierge session file channel")
+    sp.add_argument("sub", choices=["watch", "pending", "show", "reply", "archive", "alive"])
+    sp.add_argument("id", nargs="?")
+    sp.add_argument("--timeout", help="for watch, for example 1h")
+    sp.add_argument("--interval", help="for watch, seconds")
+    sp.add_argument("--status", choices=["answered", "rejected", "delivered"], default="answered")
+    sp.add_argument("--text", help="reply text or rejection reason; - for stdin")
+    sp.add_argument("--by", help="who is replying (default concierge)")
+    sp.set_defaults(fn=cmd_channel)
+
+    sp = sub.add_parser("journal", help="journal entry")
+    sp.add_argument("text", nargs="?")
+    sp.add_argument("--agent")
+    sp.add_argument("--type", help="plan-change | decision | problem | prompt-change | note | ...")
+    sp.set_defaults(fn=cmd_journal)
+
+    sp = sub.add_parser("team", help="agent spheres")
+    sp.add_argument("sub", choices=["init", "status"])
+    sp.add_argument("name", nargs="?", help="agent name for init")
+    sp.add_argument("--since", help="for status: 24h | 2026-10-05T00:00 | mark:super")
+    sp.add_argument("--agent", help="for status: only this agent; for init: creator")
+    sp.add_argument("--full", action="store_true", help="for status: full SUMMARY entries")
+    sp.set_defaults(fn=cmd_team)
+
+    sp = sub.add_parser("summary", help="agent SUMMARY.md entries")
+    sp.add_argument("sub", choices=["add"])
+    sp.add_argument("text", nargs="?", help="text or - for stdin")
+    sp.add_argument("--status", choices=["done", "partial", "blocked", "failed"], default="done")
+    sp.add_argument("--run")
+    sp.add_argument("--agent")
+    sp.set_defaults(fn=cmd_summary)
+
+    sp = sub.add_parser("lock", help="command under a lock")
+    sp.add_argument("name")
+    sp.add_argument("--ttl", default="900", help="seconds after which another lock is considered stale")
+    sp.add_argument("--wait", default="120", help="seconds to wait for release")
+    sp.add_argument("--agent")
+    sp.add_argument("cmd", nargs=argparse.REMAINDER)
+    sp.set_defaults(fn=cmd_lock)
+
+    sp = sub.add_parser("escalate", help="escalation to the super agent")
+    sp.add_argument("text", nargs="?")
+    sp.add_argument("--agent")
+    sp.set_defaults(fn=cmd_escalate)
+
+    sp = sub.add_parser("snapshot", help="copy a file to history")
+    sp.add_argument("path")
+    sp.add_argument("--note")
+    sp.add_argument("--agent")
+    sp.set_defaults(fn=cmd_snapshot)
+
+    sp = sub.add_parser("mark", help="set a time mark")
+    sp.add_argument("name")
+    sp.set_defaults(fn=cmd_mark)
+
+    sp = sub.add_parser("since", help="read a time mark")
+    sp.add_argument("name")
+    sp.set_defaults(fn=cmd_since)
+
+    sp = sub.add_parser("register", help="generate systemd --user units from agents/slots and enable timers")
+    sp.add_argument("--apply", action="store_true", help="write units and enable them (without the flag, dry run)")
+    sp.add_argument("--print", dest="print_units", action="store_true", help="print unit contents")
+    sp.add_argument("--agent")
+    sp.set_defaults(fn=cmd_register)
+
+    sp = sub.add_parser("unregister", help="disable and remove all units for this project")
+    sp.add_argument("--agent")
+    sp.set_defaults(fn=cmd_unregister)
+
+    sp = sub.add_parser("run", help="run an agent: preparation, slot queue, harness, hard limit, log")
+    sp.add_argument("agent_name")
+    sp.add_argument("--dry-run", action="store_true", help="show the command and substitutions; do not run")
+    sp.add_argument("--force", action="store_true", help="run even if the agent was paused after three consecutive failures; reset the count")
+    sp.add_argument("--task", help="task from the agent identity's Tasks section (required when the agent has multiple tasks)")
+    sp.set_defaults(fn=cmd_run)
+
+    sp = sub.add_parser("commit", help="commit the user project: agents/ to its git, then the root (submodule pointers, skills/, goal.md)")
+    sp.add_argument("-m", "--message")
+    sp.add_argument("--agent")
+    sp.set_defaults(fn=cmd_commit)
+
+    sp = sub.add_parser("init", help="lay out the user project root: git, artel and agents submodules, skills/, AGENTS.md, goal.md")
+    sp.add_argument("--project", help="project name (default: directory name)")
+    sp.add_argument("--home", help="user project root (default: current directory)")
+    sp.add_argument("--artel-url", help="artel submodule URL (default: its clone's origin or ./artel)")
+    sp.add_argument("--src", action="append", help="project repository URL, becomes src/<name> submodule; may be repeated")
+    sp.add_argument("--force", action="store_true", help="do not require artel to be a root submodule")
+    sp.set_defaults(fn=cmd_init)
+
+    sp = sub.add_parser("link", help="update skills/* and AGENTS.md symlinks in all harness directories")
+    sp.set_defaults(fn=cmd_link)
+
+    sp = sub.add_parser("skills", help="compare project skills/ with artel templates; --apply updates untouched copies and removes vanished ones")
+    sp.add_argument("--apply", action="store_true", help="write updates (without the flag, dry run)")
+    sp.add_argument("--agent")
+    sp.set_defaults(fn=cmd_skills)
+
+    sp = sub.add_parser("prompts", help="prompt library: list | show <module> | status (identity sources)")
+    sp.add_argument("sub", nargs="?", choices=["list", "show", "status"], default="list")
+    sp.add_argument("name", nargs="?", help="for show: module name, for example artel/worker or project/build")
+    sp.set_defaults(fn=cmd_prompts)
+
+    sp = sub.add_parser("schedule", help="project schedule: slots and load, agents and tasks, timers, structural notes")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--no-systemd", action="store_true", help="do not query systemd for timers")
+    sp.set_defaults(fn=cmd_schedule)
+
+    sp = sub.add_parser("slot", help="slot state: holder, queue, history")
+    sp.add_argument("slot_name", nargs="?")
+    sp.add_argument("--history", type=int, default=0, metavar="N", help="show the last N history entries")
+    sp.set_defaults(fn=cmd_slot)
+
+    sp = sub.add_parser("cheatsheet", help="one-screen reminder of how to manage the project container")
+    sp.add_argument("--container", help="container name (default artel-<project>)")
+    sp.add_argument("--user", help="container user (default: the current user)")
+    sp.add_argument("--project", help="project name when run outside a user project")
+    sp.set_defaults(fn=cmd_cheatsheet)
+
+    sp = sub.add_parser("help")
+    sp.set_defaults(fn=lambda a: print(__doc__))
+    return p
+
+
+def summary_argv(argv: list[str]) -> list[str]:
+    """`artel summary add --status X -` and `artel summary --status X add -` are equivalent: argparse does not accept
+    positional arguments interspersed with options, so options are moved forward, and `add` and text go at the end."""
+    if argv[:1] != ["summary"] or "add" not in argv:
+        return argv
+    opts, pos, rest = [], [], argv[1:]
+    i = 0
+    while i < len(rest):
+        t = rest[i]
+        if t in ("--status", "--run", "--agent") and i + 1 < len(rest):
+            opts += [t, rest[i + 1]]; i += 2; continue
+        if t.startswith("--"):
+            opts.append(t)
+        elif t != "add":
+            pos.append(t)
+        i += 1
+    return ["summary", *opts, "add", *pos]
+
+
+def main() -> None:
+    p = build_parser()
+    a = p.parse_args(summary_argv(sys.argv[1:]))
+    if not getattr(a, "fn", None):
+        print(__doc__)
+        sys.exit(EXIT_ERR)
+    try:
+        a.fn(a)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except (urllib.error.URLError, RuntimeError) as e:
+        die(f"network/telegram: {e}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,99 @@
+# agents/config.yaml — artel agent configuration for project {{PROJECT}}
+#
+# Three parts:
+#   artel:   environment facts for the `artel` script (communication channels). Maintained by the super agent and installer.
+#   slots:   parallel work lanes: directory, window, and hard limit. Agents in one slot run sequentially;
+#            agents in different slots run simultaneously (sphere is for people only; the script does not read it).
+#   agents:  agents, their tasks, and schedule. `artel register --apply` turns this into systemd --user units:
+#            a timer for each run (agent or agent.task), and a service for each long-running one.
+#
+# Edit rule: first `artel snapshot agents/config.yaml`, then edit it and add a journal entry
+# (`artel journal --type config-change "what and why"`), then run `artel register` (the dry run shows upcoming
+# triggers and structural warnings) and `artel register --apply`. Check visually with `artel schedule`.
+# The agent's work content (who it is, what it knows, what it may do, and its possible tasks) lives in its identity
+# agents/agent-<name>.md; this file contains only when, where, with what, and for which task it runs.
+
+artel:
+  project: {{PROJECT}}
+  git:
+    autocommit: true          # after every completed timer run, commit the user project: agents/ and src/ submodule pointers
+  channel:
+    quiet_hours: ""           # e.g. "23:00-08:00": the script asks no questions and sends messages quietly; empty = none
+    telegram:
+      env_file: ~/.config/artel/{{PROJECT}}.telegram.env   # lines ARTEL_TG_TOKEN=... and ARTEL_TG_CHAT_ID=...
+      dedicated_bot: false    # true if artel alone reads this bot's incoming getUpdates; otherwise ask via Telegram is unavailable
+
+slots:
+  # A slot is reserved for the agent's working time, not for the window: as soon as the agent exits (after
+  # 3 minutes or after 70), the slot takes the next item in the queue. A timer trigger for a busy slot enters a FIFO
+  # queue and waits up to max_wait (4 hours by default, longer than any reasonable holder hard_limit); a repeated
+  # trigger for the same run collapses while it is running or waiting. The prompt receives a window
+  # ({{WINDOW_END}}, {{BUDGET_MIN}}) calculated from the actual start. A run that exceeds hard_limit is killed with
+  # a journal and SUMMARY entry.
+  # Number of slots: one for each independent work lane. Agents that write to the same files (one repository
+  # without a worktree, a shared registry) share a slot; the rest get their own. One slot for the entire agent
+  # team creates a queue for everything; `artel schedule` warns about this.
+  main:
+    dir: {{PROJECT_DIR}}          # agents' working directory: user project directory; project code in src/<repository>
+    sphere: project code edits
+    window: 50m               # how long the agent reserves the slot; this is its budget
+    hard_limit: 90m           # always longer than window; then SIGTERM, followed by SIGKILL after 30s
+    # max_wait: 4h            # how long a run may wait in the queue; should not be shorter than hard_limit
+  # research:                 # second lane: reading, searching, checking; writes no code
+  #   dir: {{PROJECT_DIR}}
+  #   sphere: research and fact checking
+  #   window: 30m
+  #   hard_limit: 60m
+
+agents:
+  # The super agent is mandatory. Set frequency according to the number of agents and quotas: once a day while there are few agents.
+  super:
+    harness: claude
+    model: opus                 # Claude aliases: opus | sonnet | haiku | fable; fable is stronger than opus but also spends its weekly window
+    effort: high
+    slot: main
+    schedule: { at: "00:00" }                 # or an OnCalendar string, or {days, from, to, every}
+    prompt: |
+      You are the super agent; your identity is skills/super/SKILL.md. This is a timer run: perform one management
+      iteration. Window ends at {{WINDOW_END}}, budget is {{BUDGET_MIN}} minutes, hard limit is {{HARD_LIMIT_MIN}} minutes.
+
+  # Concierge: a long-running tmux service, communicating with the user through Claude remote-control.
+  concierge:
+    kind: service
+    harness: claude
+    model: sonnet
+    effort: medium
+    remote_control: true
+    name: artel-{{PROJECT}}                   # session name in claude.ai
+    system_prompt_file: agents/concierge.md
+    prompt: "Start concierge duty according to the system prompt."
+    env:
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: "400000"
+
+  # Example worker agent with several tasks (the installer replaces it with real agents).
+  # No run prompt is set, so `artel run` builds it: “You are agent builder … Your identity is
+  # agents/agent-builder.md … work on task ‘implement’ … Window ends …”. Each task in tasks gets its own timer
+  # artel-{{PROJECT}}-builder.<task>; task fields override agent fields (schedule, prepare, prompt, window,
+  # hard_limit, max_wait, session, env, enabled). The task descriptions themselves live in the identity's “Tasks” section.
+  # builder:
+  #   harness: codex                 # claude | codex | agy | opencode
+  #   model: gpt-5.6-luna
+  #   effort: high
+  #   slot: main
+  #   tasks:
+  #     implement:                   # next task from PLAN.md: code until tests pass
+  #       schedule: { days: "*", from: "01:00", to: "09:00", every: 1h }
+  #       prepare: agents/team/builder/prepare.sh   # exit 0: work; stdout → {{PREPARE}}; exit 3: no work, cancel the run
+  #     cleanup:                     # once a day: worktree cleanup, stale branches
+  #       schedule: { at: "10:00" }
+  #       window: 20m
+  #   env:
+  #     CLAUDE_CODE_AUTO_COMPACT_WINDOW: "300000"
+  #
+  # Agent with one task: use the task field instead of tasks and a regular schedule.
+  # reviewer:
+  #   harness: claude
+  #   model: sonnet
+  #   slot: research
+  #   task: review
+  #   schedule: { at: ["06:00", "18:00"] }
