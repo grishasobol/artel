@@ -9,7 +9,9 @@ a commit, a command and its output, a path. Finished phases are folded into `<de
 Make artel a public project: readable in English by any developer, free of the author's private data,
 with a documented update path for running installations, and verified on a clean Linux host. Then make the
 process cheaper and self-improving: phases 5-9 implement the findings of the three-model consilium of
-2026-10-27 (below), to be taken one at a time and tried on the running installations.
+2026-10-27 (below), to be taken one at a time and tried on the running installations. Phase 10 implements
+the recommendations of `docs/research/07-prompt-portability-across-models-and-harnesses.md`: one neutral
+text per module and skill, a short curated layer of model notes, and measured per-model tuning.
 
 ## Consilium findings (2026-10-27)
 Audit of the approach by Claude, Codex and Gemini against four wanted properties: flexibility across task
@@ -55,6 +57,7 @@ snapshot/history and the "2-3 reversible changes per iteration" rule.
 - [ ] 7 · Task-level pipeline: model per task, `verify`, `on_success`, `on_fail`
 - [ ] 8 · Reactive runs: chains, `watch_paths`, persistent timers
 - [ ] 9 · Evolution loop of the super agent: experiments, crystallisation, project profiles
+- [ ] 10 · Model-aware prompts: portability lint, `models/` notes, measured per-model tuning
 
 ### Phase 1 · Publication readiness
 Goal: every file in the repository is in English, consistent with the others, free of personal data and of
@@ -311,6 +314,57 @@ Steps:
       "script + cheap worker + verify + strong reviewer on_fail" and compare cost per closed step. Done
       when: the numbers are recorded here with the decision to keep or roll back.
 
+### Phase 10 · Model-aware prompts
+Goal: one canonical text per library module and per skill serves all four harnesses; what really differs
+between models reaches an identity through a short curated note applied at compile time; per-model tuning
+of identities is measured and reversible; mechanical portability failures are caught by a script.
+Source: `docs/research/07-prompt-portability-across-models-and-harnesses.md` (sections 7 and 8).
+Depends on: nothing for 10-01 to 10-04; phases 6 and 9 for 10-05 and 10-06.
+Success criteria:
+- `artel lint` exits 0 on this repository and on a generated mock project, and exits non-zero on a fixture
+  for each known failure class (section 3 of the report).
+- `templates/prompts/models/` holds `claude`, `gpt`, `gemini` and `open-weights`, each at most 25 lines of
+  behavioural deltas, each claim with its source and a `checked:` date and model list in the frontmatter.
+- An identity compiled for an agent lists its `models/<family>` module in `sources:`, and `artel prompts
+  status` reports it stale after that module changes.
+- The super agent writes no library modules and no worker skills; model-specific lessons reach this
+  repository as `model-note` journal entries and are promoted or rejected here by a reviewed commit.
+- One measured before-and-after comparison for an open-weight worker model is recorded in this file.
+Steps:
+- [ ] 10-01 · lead · `artel lint`: for every `SKILL.md` under `templates/skills`, `.agents/skills` and a
+      project's `skills/`: exact file name, `name` equal to the directory, description at most 1,024
+      characters, frontmatter keys from the Agent Skills spec plus an allowlist (`argument-hint`), body under
+      500 lines, YAML that loads under PyYAML's safe loader with no BOM; instruction files (`AGENTS.md`,
+      `CLAUDE.md`) under 24,000 bytes; templates free of ALL-CAPS emphasis words and "show your reasoning"
+      phrases; the Cyrillic check, locale-independent, with `README.md` as the only allowed file (the grep in
+      `CLAUDE.md` misfires on macOS with an empty `LANG` and matches its own pattern in `AGENTS.md` and
+      `CLAUDE.md`). Done when: lint passes on the repository and the mock, fails on fixtures in
+      `tests/fixtures/lint/` (apostrophe in a single-quoted description, BOM, 1,100-character description,
+      lower-case `skill.md`, an unknown key), and the "Checks" section of `CLAUDE.md` runs it.
+- [ ] 10-02 · lead · Prompt group `models/` with four modules of behavioural deltas, for example: Claude in
+      unattended runs is told it runs unattended and when to stop and ask, never asked to echo its
+      reasoning; GPT-6 models are told when to delegate; open-weight models get explicit structure, one
+      worked example, a single system message and the vendor's sampling settings. Done when: `artel prompts`
+      lists the four modules, each is at most 25 lines, and every claim cites report 07 or a run.
+- [ ] 10-03 · lead · Compile rule: `artel/team-design` names `models/<family>` as a source next to
+      `harness/<name>`; changing an agent's model or harness counts as a prompt change and means recompiling
+      from the library; the comment on "Harness and model" in `agent-prompt.md`, the group list in the super
+      skill, "Where the rest lives" in the charter and the README layout name the new group. Done when: grep
+      finds `models/` in each of those files, and on the mock `artel prompts status` reports an identity stale
+      after its `models/` module is edited.
+- [ ] 10-04 · lead · Curation path: the super skill tells the super agent to record a model-specific fix that
+      held over several runs as `artel journal --type model-note` with the evidence; this file's "Working with
+      the plan" notes in `CLAUDE.md` describe promoting a note into `models/*` and pruning notes a new model
+      generation no longer needs. Done when: the super skill names the entry type and the condition, and
+      `CLAUDE.md` describes the promotion.
+- [ ] 10-05 · lead · Per-model tuning of an identity as an experiment: the "Tuning an identity" section of
+      `artel/team-design` requires a hypothesis, the `artel stats` metric it should move and a run budget,
+      and uses `artel experiment` for rollback. Depends on: 06-03, 09-01. Done when: the section names the
+      command and the metric, and an experiment on the mock rolls an identity edit back.
+- [ ] 10-06 · user · On a running installation with an opencode worker: share of runs ending `advanced`
+      versus `noop` or `failed` per model, before and after applying `models/open-weights`. Depends on:
+      06-01, 10-03. Done when: the numbers and the keep-or-revert decision are recorded here.
+
 ## Deferred and cancelled
 | item | reason |
 |---|---|
@@ -319,4 +373,6 @@ Steps:
 | Own durable queue, webhook server or orchestrator daemon in the container | rejected 2026-10-27: reliability rests on `systemd --user`, `flock` and the file system; `systemd.path` and persistent timers suffice |
 | Mandatory hand-written `prepare` for every task | rejected 2026-10-27: the built-in `artel brief` gates and briefs by default; a project prepare only extends it |
 | `tasks.jsonl` replacing the Markdown planning files for every project | deferred 2026-10-27: Markdown stays the default; the registry is an option for `ops`/`pipeline` profiles (09-05) |
+| Per-harness or per-model copies of prompt modules and skills in this repository | rejected 2026-10-27 (report 07): the copies multiply with modules, harnesses and models, age with every model release, and nothing measures whether a copy beats the neutral text plus a `models/` note |
+| The super agent authoring library modules or worker skills on its own | rejected 2026-10-27 (report 07): SkillsBench measured self-written skills below no skills at all (-8 to -11.5 points); lessons come back as `model-note` entries and are curated here |
 | Context caching across runs via `session: continue` | deferred: never tried on a live project; the brief keeps fresh sessions small instead; measure in 06-05 before deciding |
