@@ -54,6 +54,9 @@ high. Use `xhigh`, `max`, and `ultra` only when maximum reasoning is needed and 
 ## Token accounting
 - `turn.completed.usage`: `input_tokens`, `cached_input_tokens`, `output_tokens`, and `reasoning_output_tokens`.
   Trap: `input_tokens` includes `cached_input_tokens` (agy does the opposite). Fresh input = `input − cached`.
+  Trap: the figures are cumulative over the thread. After `codex exec resume` the event reports everything the
+  session has spent so far (0.166.0: 27 265 input tokens after the first run, 54 894 after the resumed one); the
+  spend of one run is the difference to the previous event of that thread.
 - Cumulative per thread: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, `token_count` event (`info.total_token_usage`),
   with `rate_limits` and `used_percent` by window in the same place.
 - Sub-agent spend is not included in the parent's `usage` (separate rollouts with `parent_thread_id`).
@@ -67,7 +70,8 @@ for l in sys.stdin:
     if e.get("type")=="thread.started": print(e["thread_id"])')
 codex exec resume "$ID" --skip-git-repo-check -c 'sandbox_mode="workspace-write"' "clarification" </dev/null
 ```
-Trap: `codex exec resume` does not understand `-s`; set the sandbox only through `-c 'sandbox_mode=...'`.
+Trap: `codex exec resume` does not understand `-s` or `-C`; set the sandbox only through
+`-c 'sandbox_mode=...'` and start the process in the working directory.
 Do not use `resume --last` in automation; parallel runs race.
 
 ## Parallel workers

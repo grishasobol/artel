@@ -36,8 +36,10 @@ claude -p "<prompt>" --model sonnet --effort high --strict-mcp-config --dangerou
 - Without `--dangerously-skip-permissions` in headless mode, any tool that writes or runs a command waits for approval
   that nobody will provide. In an isolated container, the flag is safe and required.
 - `--output-format json` returns one JSON line: `result` (response text), `session_id`, `total_cost_usd`, `usage`
-  (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`), `num_turns`, and
-  `is_error`. Check `is_error` and the exit code.
+  (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`), `modelUsage` (the
+  same counts per model, with `costUSD`), `num_turns`, and `is_error`. Check `is_error` and the exit code.
+  `input_tokens` excludes cache reads and cache writes. In a process that takes several prompts (stream-json
+  input) `usage` and `num_turns` are per result, `modelUsage` and `total_cost_usd` are cumulative.
 - `--max-budget-usd N` limits the run's dollar spend, guarding against a worker loop (`--max-turns` was removed in
   2.1.3xx; in `config.yaml` the field is `max_budget_usd`).
 - `--append-system-prompt-file <file>` adds a system prompt without replacing the built-in one. This is how the
@@ -96,7 +98,10 @@ Tell the worker in its prompt: “do not end the turn with the word ‘waiting�
 Built-in sub-agents (Agent tool) inherit the parent model without an explicit `model`, and a sub-agent on `opus` or
 `fable` can consume a five-hour window in minutes. Keep them on `sonnet` or `haiku` with effort no higher than `high`,
 and tell a worker on opus/fable explicitly: “launch sub-agents only with `model: sonnet`.” A strong model on a
-subtask is a separate `claude -p` process or another harness. Sub-agent spend is included in the parent's `usage`.
+subtask is a separate `claude -p` process or another harness. Sub-agent spend is not in the parent's top-level
+`usage`: it is in `modelUsage` (one entry per model) and in `total_cost_usd`, and `subagent_stats` counts the
+sub-agents started. Measured on 2.1.325: a haiku run that asked one sonnet sub-agent for a sum reported 285
+output tokens in `usage`, and `modelUsage` showed the sonnet entry costing 13 times the parent's.
 
 ## Model selection
 | task | model / effort |

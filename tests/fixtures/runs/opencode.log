@@ -1,0 +1,10 @@
+# 2026-11-13 21:53 agent=builder task=- harness=opencode cwd=/home/artel/scratch/work window_end=00:00 hard_end=00:00
+# synthetic: written by hand from the opencode 1.x event shape (`run --format json`), not captured from a run
+# opencode run 'Create a file named note.txt in the current directory that contains the single word ok, then reply with the single word done.' --format json --auto
+
+{"type":"step_start","timestamp":1794603200000,"sessionID":"ses_0000000000000001","part":{"id":"prt_0001","sessionID":"ses_0000000000000001","messageID":"msg_0001","type":"step-start"}}
+{"type":"tool_use","timestamp":1794603201000,"sessionID":"ses_0000000000000001","part":{"id":"prt_0002","sessionID":"ses_0000000000000001","messageID":"msg_0001","type":"tool","tool":"write","state":{"status":"completed","input":{"filePath":"/home/artel/scratch/work/note.txt","content":"ok"}}}}
+{"type":"step_finish","timestamp":1794603202000,"sessionID":"ses_0000000000000001","part":{"id":"prt_0003","sessionID":"ses_0000000000000001","messageID":"msg_0001","type":"step-finish","reason":"tool-calls","cost":0.0012,"tokens":{"input":9000,"output":40,"reasoning":10,"cache":{"read":3000,"write":200}}}}
+{"type":"step_start","timestamp":1794603203000,"sessionID":"ses_0000000000000001","part":{"id":"prt_0004","sessionID":"ses_0000000000000001","messageID":"msg_0002","type":"step-start"}}
+{"type":"text","timestamp":1794603204000,"sessionID":"ses_0000000000000001","part":{"id":"prt_0005","sessionID":"ses_0000000000000001","messageID":"msg_0002","type":"text","text":"done"}}
+{"type":"step_finish","timestamp":1794603205000,"sessionID":"ses_0000000000000001","part":{"id":"prt_0006","sessionID":"ses_0000000000000001","messageID":"msg_0002","type":"step-finish","reason":"stop","cost":0.0008,"tokens":{"input":500,"output":5,"reasoning":0,"cache":{"read":12000,"write":0}}}}

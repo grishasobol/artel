@@ -109,8 +109,8 @@ to a minute), `notify` and `ask` (contact with the user), `team`, `summary`, `jo
 
 Running an agent: `artel run <agent> [--task name]` reads `agents/config.yaml`, runs the prepare script, takes
 the slot, substitutes the window, the budget and the task name into the prompt, starts the harness, kills it
-at the hard limit with a journal entry, and after completion commits `agents/` and the root (under an
-inter-process lock). The content of the work lives in the identity `agents/agent-<name>.md`. An agent may have
+at the hard limit with a journal entry, appends one record to `agents/state/runs.jsonl` (outcome, steps
+touched, tokens per model), and after completion commits `agents/` and the root (under an inter-process lock). The content of the work lives in the identity `agents/agent-<name>.md`. An agent may have
 several tasks with different schedules (`tasks:`), each with its own timer `artel-<project>-<agent>.<task>`.
 
 A slot is a lane of parallelism: agents of one slot run strictly one after another, agents of different slots

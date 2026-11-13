@@ -1,0 +1,11 @@
+# 2026-11-13 21:56 agent=builder task=- harness=claude cwd=/home/artel/scratch/work window_end=00:00 hard_end=00:00
+# claude -p --input-format stream-json --output-format stream-json --verbose --strict-mcp-config --effort low --dangerously-skip-permissions --model haiku
+# prompt (stdin): 'Use the Agent tool exactly once, with model sonnet, to ask a sub-agent to reply with the sum of 2 and 2. Then reply with the number it returned and nothing else.'
+
+# session_id: 00000000-0000-4000-8000-000000000002  model: claude-haiku-5-5
+→ Agent: What is the sum of 2 and 2? Reply with only the number.
+🔔 background task a000000000000001: completed
+💬 4
+# turn complete: 2 turns, $0.05 total, background tasks 0
+# session closed: work complete; no background tasks
+{"type":"result","subtype":"success","is_error":false,"result":"4","stop_reason":"end_turn","session_id":"00000000-0000-4000-8000-000000000002","num_turns":2,"duration_ms":7897,"total_cost_usd":0.049116419999999994,"usage":{"input_tokens":4,"cache_creation_input_tokens":14893,"cache_read_input_tokens":37092,"output_tokens":285},"modelUsage":{"claude-haiku-5-5":{"inputTokens":4,"outputTokens":285,"cacheReadInputTokens":37092,"cacheCreationInputTokens":14893,"webSearchRequests":0,"costUSD":0.00349242,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":105,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":14893,"canonicalModel":"claude-haiku-5-5","provider":"firstParty","costBasis":"list"},"claude-sonnet-5-5":{"inputTokens":2,"outputTokens":3,"cacheReadInputTokens":0,"cacheCreationInputTokens":18236,"webSearchRequests":0,"costUSD":0.045624,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":18236,"cacheCreationEphemeral1hInputTokens":0,"canonicalModel":"claude-sonnet-5-5","provider":"firstParty","costBasis":"list"}},"subagent_stats":{"spawned":1,"requested":{"background":0,"foreground":1,"unset":0},"started_in_background":0,"max_depth":1,"spawned_by_subagents":0,"completed":1,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{"general-purpose":1}},"session_mode":"stream","turn_results":1}

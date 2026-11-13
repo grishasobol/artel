@@ -53,7 +53,7 @@ snapshot/history and the "2-3 reversible changes per iteration" rule.
 - [ ] 3 · Live verification of what was only mocked
 - [~] 4 · Public repository hygiene (license, history and rename done; smoke test and contribution notes open)
 - [ ] 5 · Brief and bounded state: `artel brief` as the default prepare for every agent
-- [ ] 6 · Run telemetry and `artel stats`
+- [~] 6 · Run telemetry and `artel stats` (since 2026-11-13; run records done for claude, codex and agy)
 - [ ] 7 · Task-level pipeline: model per task, `verify`, `on_success`, `on_fail`
 - [ ] 8 · Reactive runs: chains, `watch_paths`, persistent timers
 - [ ] 9 · Evolution loop of the super agent: experiments, crystallisation, project profiles
@@ -146,6 +146,13 @@ Steps:
 - [ ] 03-07 · The installer-driven first run (`artel run super` with no `agents/rules.md`, docs/install.md
       step 7) seen on a live container with real logins: rules, plan, roster and timers appear without a
       live session; the hand-over summary and `artel cheatsheet` shown to the user.
+- [ ] 03-08 · The opencode command of `build_harness_cmd` against opencode 2.x. Found 2026-11-13 on macOS with
+      opencode 2.1.4: `opencode run <prompt> --format json --auto --dir <cwd> --variant low -m <model>` exits 1
+      with "Unrecognized flag: --dir" and "Unrecognized flag: --variant"; 2.x takes the variant as
+      `provider/model#variant` and has no `--dir`. `install/inside/provision.sh` installs the latest opencode,
+      so a new container gets 2.x. Done when: an opencode agent completes a run in a container on the installed
+      version, `harness/opencode` and `artel/config` describe that form, and `tests/fixtures/runs/opencode.log`
+      is a captured log (see 06-01).
 
 ### Phase 4 · Public repository hygiene
 Goal: the repository can be pushed to a public remote as is.
@@ -228,11 +235,33 @@ Success criteria:
   flags agents whose idle share or cost per step is above the project median.
 - `artel brief super` includes the stats block.
 Steps:
-- [ ] 06-01 · lead · Parse usage from the four harness outputs in `cmd_run` (claude stream-json `usage`,
-      codex `turn.completed.usage`, agy usage line, opencode) into `runs.jsonl`; outcome from the SUMMARY
-      entry and exit code. Done when: a `--dry-run` with a replayed log file writes a correct record for
-      each harness (fixtures in `tests/fixtures/`). Reference: gstack `test/helpers/providers/claude.ts` and
-      `gpt.ts` read the same usage fields for claude and codex; records are written through the 12-01 writer.
+- [~] 06-01 · lead, since 2026-11-13 · Parse usage from the four harness outputs in `cmd_run` (claude
+      stream-json `usage`, codex `turn.completed.usage`, agy usage line, opencode) into `runs.jsonl`; outcome
+      from the SUMMARY entry and exit code. Done when: a `--dry-run` with a replayed log file writes a correct
+      record for each harness (fixtures in `tests/fixtures/`). Reference: gstack
+      `test/helpers/providers/claude.ts` and `gpt.ts` read the same usage fields for claude and codex; records
+      are written through the 12-01 writer.
+      Done for claude, codex and agy (evidence, 2026-11-13, macOS, python 3.15, no PyYAML):
+      `bash tests/telemetry-smoke.sh` prints 10 `ok` lines and `all 10 checks passed`. It replays the logs of
+      `tests/fixtures/runs/` through `artel run <agent> --dry-run --replay-log <file>` (the record is printed,
+      not written), then starts seven real `artel run`s whose `cmd:` is a stub that prints a saved log and acts
+      as the agent: outcome `blocked` with step `03-02` from the SUMMARY entry; a resumed codex session
+      recorded as the difference to the previous record (493 fresh, 27 136 cached, 130 output of 54 894 input
+      reported); `advanced` with step `01-02` from a mark changed in PLAN.md; `noop` for a "no work" entry and
+      for a run without any trace; `failed` with its spend kept; `killed` at a 2 s hard limit. The fixtures of
+      the three harnesses are logs captured with the commands `build_harness_cmd` assembles
+      (`tests/fixtures/runs/README.md`). Live, same day, three agents on a mock project through `artel run`
+      without a stub: claude haiku `blocked · tokens 14482 in + 37072 cached, 102 out` with step `02-05`,
+      codex gpt-5.6-luna `noop · tokens 3298 in + 10240 cached, 5 out` and, resumed, `2351 in + 40192 cached,
+      26 out` against session totals of 5 649 and 50 432, agy gemini-3.8-flash-low `noop · tokens 9231 in + 0
+      cached, 1 out`.
+      Outcome rule: `killed` on a kill, `failed` on a non-zero exit or a `failed` entry, `blocked` on a
+      `blocked` entry, `advanced` when a step mark changed in ROADMAP or the agent's PLAN or the entry is
+      `done`/`partial` without "no work", otherwise `noop`. The JSONL half of 12-01 exists as `jsonl_append`
+      and `jsonl_read` (100 records from 10 concurrent writers and a truncated line read back as 100).
+      Open: the opencode parser is written from the 1.x event shape and its fixture is synthetic, because
+      opencode 2.1.4 does not start here (03-08); a run in a container with `systemd --user` and PyYAML was
+      not made.
 - [ ] 06-02 · worker · `quota-history.jsonl` appended by `cmd_quota` on every full snapshot. Done when: the
       quota timer produces one line per 20 minutes on the mock.
 - [ ] 06-03 · lead · `artel stats` with the metrics above and the flags; block form for the brief. Done when:
@@ -244,6 +273,20 @@ Steps:
       stats, not from reading logs. Done when: the skill names the stats fields it reads.
 - [ ] 06-05 · user · Correlate cache-read tokens with subscription percent on a running installation (claude
       and codex) and record the ratio in `harness/*.md`. Done when: the modules state tokens per percent.
+Executor record (06-01, lead in the main session, no workers): four facts the plan and the harness notes had
+wrong or did not know, each found by capturing a real log before writing the parser. (1) claude's top-level
+`usage` leaves sub-agents out: a haiku run with one sonnet sub-agent showed haiku only in `usage` and both in
+`modelUsage`, the sub-agent costing 13 times the parent ($0.0456 against $0.0035 for a sum of two numbers);
+`harness/claude` said the opposite. In a process with several results `usage` is per result, `modelUsage` and
+`total_cost_usd` are cumulative. (2) codex `turn.completed.usage` is cumulative over the thread, confirmed by
+`total_token_usage` in the session file; an agent with `session: continue` would have been recorded with a
+growing sum. (3) `codex exec resume` rejects `-C`, so `session: continue` could not work for a codex agent
+since `build_harness_cmd` always added it; fixed, the resumed run then completed (rc 0). (4) opencode 2.x
+rejects the flags of the opencode command (03-08). One `codex exec resume` hung at `turn.started` for 17
+minutes with no output; the same command completed in seconds on the next two tries; the run was stopped with
+SIGTERM and recorded as `killed` with `tokens unknown`. A claude run killed before its first result is recorded
+from the responses seen (`usage_partial`), where the output count is understated: the streamed events of the
+probe summed to 43 output tokens against 172 in the results.
 
 ### Phase 7 · Task-level pipeline
 Goal: the pattern "script → cheap worker → check script → expensive supervisor only on failure or for
@@ -439,7 +482,8 @@ Success criteria:
 - The library has `procedures/unattended-decisions`, `procedures/plan-review` and
   `procedures/health-check`; the charter names one-way doors; `artel/worker` names the stop rules.
 Steps:
-- [ ] 12-01 · lead · Write guard: one writer in `bin/artel` for agent-written text and JSONL records rejects
+- [~] 12-01 · lead, since 2026-11-13 (the JSONL writer and tolerant reader exist as `jsonl_append` and
+      `jsonl_read`, checked in `tests/telemetry-smoke.sh`, see 06-01; the guard on free text is open) · Write guard: one writer in `bin/artel` for agent-written text and JSONL records rejects
       free text that matches instruction-like patterns (port of `INJECTION_PATTERNS` in gstack
       `lib/jsonl-store.ts`), appends each JSONL record as one line in one write, and a tolerant reader skips a
       corrupt or truncated line. Done when: a fixture entry containing "ignore previous instructions" exits
@@ -592,7 +636,9 @@ Steps:
       the figure in the journal. `artel/config` states that `max_budget_usd` stays claude-only and that
       `max_tokens` works wherever 06-01 reads usage. Done when: a replayed fixture exceeding the limit is
       killed at the first record over it, for each harness with a fixture.
-- [ ] 14-05 · worker · Spend by model: `runs.jsonl` records a `models` map (claude: `modelUsage` of the result
+- [~] 14-05 · lead, since 2026-11-13 (the `models` map is in the record: `tests/telemetry-smoke.sh` check 5
+      reads two models from `tests/fixtures/runs/claude-subagent.log`; the flag in `artel stats` waits for
+      06-03) · Spend by model: `runs.jsonl` records a `models` map (claude: `modelUsage` of the result
       message, checked on 2.1.325; the other harnesses: the one model of the run); `artel stats` flags a run
       whose map holds a second model outside the cheap tier of `charter.md`. Done when: a fixture result with
       two models, one of them strong, is flagged and a fixture with a sonnet sub-agent is not.

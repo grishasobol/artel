@@ -53,7 +53,11 @@ python3 -m py_compile bin/artel
 bash -n install/*.sh install/inside/*.sh
 bin/artel help >/dev/null
 git ls-files | xargs grep -lE "[А-Яа-яЁё]"      # expect: README.md only
+bash tests/telemetry-smoke.sh                   # run records: `artel run` with saved harness logs and a stub
+bash tests/consilium-smoke.sh                   # consilium driver with mock participants
 ```
+Both smoke tests need only python3 and spend no quota; where PyYAML is missing, `tests/lib-no-pyyaml/` stands in
+for it (the test config is JSON).
 The behavioural check needs a Linux host because `artel` depends on `systemd --user`, Incus and the four
 harnesses. The mock used so far (todo.md step 01-13): clone, create an empty project directory, export
 `ARTEL_AD` to its `agents/`, then run `artel init`, `artel prompts`, `artel skills --apply`, `artel team init

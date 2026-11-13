@@ -1,0 +1,10 @@
+# 2026-11-13 21:53 agent=builder task=- harness=claude cwd=/home/artel/scratch/work window_end=00:00 hard_end=00:00
+# claude -p --input-format stream-json --output-format stream-json --verbose --strict-mcp-config --effort low --dangerously-skip-permissions --model haiku
+# prompt (stdin): 'Create a file named note.txt in the current directory that contains the single word ok, then reply with the single word done.'
+
+# session_id: 00000000-0000-4000-8000-000000000001  model: claude-haiku-5-5
+→ Bash: printf 'ok' > note.txt && cat note.txt
+💬 done
+# turn complete: 2 turns, $0.00 total, background tasks 0
+# session closed: work complete; no background tasks
+{"type":"result","subtype":"success","is_error":false,"result":"done","stop_reason":"end_turn","session_id":"00000000-0000-4000-8000-000000000001","num_turns":2,"duration_ms":4453,"total_cost_usd":0.00332044,"usage":{"input_tokens":4,"cache_creation_input_tokens":14490,"cache_read_input_tokens":37104,"output_tokens":102},"modelUsage":{"claude-haiku-5-5":{"inputTokens":4,"outputTokens":102,"cacheReadInputTokens":37104,"cacheCreationInputTokens":14490,"webSearchRequests":0,"costUSD":0.00332044,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"cacheCreationEphemeral5mInputTokens":0,"cacheCreationEphemeral1hInputTokens":14490,"canonicalModel":"claude-haiku-5-5","provider":"firstParty","costBasis":"list"}},"subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"session_mode":"stream","turn_results":1}

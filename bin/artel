@@ -2857,7 +2857,9 @@ def build_harness_cmd(a_def: dict, prompt: str, cwd: Path, resume: str | None) -
                  "-c", f'model_reasoning_effort="{effort}"']
         if model:
             argv += ["-m", str(model)]
-        argv += ["-C", str(cwd), prompt]
+        if not resume:   # `codex exec resume` rejects -C; the run is started in cwd either way
+            argv += ["-C", str(cwd)]
+        argv.append(prompt)
         return harness, argv, False
     if harness == "agy":
         argv = ["agy", f"-p={prompt}", "--output-format", "json", "--dangerously-skip-permissions",
@@ -2925,6 +2927,7 @@ class ClaudeLive:
         self.idle_since: float | None = None
         self.closed = False
         self.results: list[dict] = []
+        self.requests: dict[str, tuple] = {}   # message id → (model, usage) of every model response seen
         self.session_id: str | None = None
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -2967,7 +2970,10 @@ class ClaudeLive:
         kind, sub = ev.get("type"), ev.get("subtype")
         if kind == "assistant":
             self.in_turn, self.idle_since = True, None
-            for block in (ev.get("message") or {}).get("content") or []:
+            msg = ev.get("message") or {}
+            if msg.get("id") and isinstance(msg.get("usage"), dict):
+                self.requests[msg["id"]] = (msg.get("model"), msg["usage"])
+            for block in msg.get("content") or []:
                 if block.get("type") == "text" and block.get("text", "").strip():
                     self._w("💬 " + block["text"].strip())
                 elif block.get("type") == "tool_use":
@@ -3003,7 +3009,18 @@ class ClaudeLive:
 
     def summary(self) -> dict:
         if not self.results:
-            return {"type": "result", "is_error": True, "result": "session produced no result", "session_mode": "stream"}
+            out = {"type": "result", "is_error": True, "result": "session produced no result", "session_mode": "stream"}
+            if self.requests:   # killed before the first result: input as seen per response; output is understated,
+                mu: dict = {}   # because a streamed response carries its output count before the response is complete
+                for model, u in self.requests.values():
+                    m = mu.setdefault(str(model or "unknown"), dict.fromkeys(
+                        ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"), 0))
+                    for src, dst in (("input_tokens", "inputTokens"), ("output_tokens", "outputTokens"),
+                                     ("cache_read_input_tokens", "cacheReadInputTokens"),
+                                     ("cache_creation_input_tokens", "cacheCreationInputTokens")):
+                        m[dst] += _num(u.get(src))
+                out.update(modelUsage=mu, usage_partial=True, session_id=self.session_id)
+            return out
         out = dict(self.results[-1])
         usage: dict = {}
         for r in self.results:
@@ -3014,6 +3031,252 @@ class ClaudeLive:
                    is_error=any(r.get("is_error") for r in self.results[-1:]), session_mode="stream",
                    turn_results=len(self.results))
         return out
+
+
+# ── run telemetry: one record per run in state/runs.jsonl ──
+
+RUN_STATUSES = ("done", "partial", "blocked", "failed")
+STEP_ID_RE = re.compile(r"(?<![\w-])\d{2}-\d{2}(?![\w-])")
+STEP_MARK_RE = re.compile(r"(?m)^\s*- \[(.)\] (\d{2}-\d{2})(?![\w-])")
+NO_WORK_RE = re.compile(r"\bno work\b|\bnothing to do\b", re.I)
+USAGE_FIELDS = ("input", "cache_read", "cache_write", "output")
+
+
+def jsonl_append(path: Path, record: dict) -> None:
+    """One record, one line, one write on an O_APPEND descriptor: lines of concurrent writers never interleave."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def jsonl_read(path: Path) -> list[dict]:
+    """Records of a JSONL file in order; a corrupt or truncated line is skipped."""
+    out = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def _num(v) -> int:
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+
+def log_events(text: str) -> list[dict]:
+    """JSON objects that stand alone on a line of a run log; everything else in the log is ignored."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict):
+                out.append(ev)
+    return out
+
+
+def run_usage(harness: str, text: str) -> dict | None:
+    """Token spend of a run read from its log, or None when the log holds none (a run killed before the harness
+    reported, a custom `cmd` with another output). Keys: `input` (read at full price), `cache_read`, `cache_write`,
+    `output` (reasoning included), `cost` (list price in USD where the harness reports one), `turns` (as the harness
+    counts them, not comparable across harnesses), `session`, `models` (spend per model where the harness reports
+    it), `cumulative` (the figures cover the whole session, not this run), `partial` (the run ended without a
+    final report and the figures are what was seen until then).
+    The harnesses disagree on what input means, so each is normalised here:
+    claude · `input_tokens` excludes cache reads and writes; the top-level `usage` leaves out sub-agents, so totals
+      come from `modelUsage`, which is cumulative over the process and has one entry per model;
+    codex · `input_tokens` includes `cached_input_tokens`; `turn.completed.usage` is cumulative over the thread, so a
+      resumed run reports everything spent in the session so far;
+    agy · `input_tokens` excludes `cache_read_tokens`; `output_tokens` includes thinking;
+    opencode · every finished step carries `tokens` (`input`, `output`, `reasoning`, `cache.read`, `cache.write`)
+      and `cost`; the steps are summed."""
+    events = log_events(text)
+    tot = dict.fromkeys(USAGE_FIELDS, 0)
+    res: dict = {"cost": None, "turns": None, "session": None, "models": None, "cumulative": False, "partial": False}
+    if harness == "claude":
+        results = [e for e in events if e.get("type") == "result"]
+        live = [e for e in results if e.get("session_mode") == "stream"]     # the summary line written by ClaudeLive
+        if live:
+            results = live[-1:]
+        if not results:
+            return None
+        last = results[-1]
+        models = {}
+        for name, v in (last.get("modelUsage") or {}).items():
+            if isinstance(v, dict):
+                models[str(name)] = {"input": _num(v.get("inputTokens")), "cache_read": _num(v.get("cacheReadInputTokens")),
+                                     "cache_write": _num(v.get("cacheCreationInputTokens")),
+                                     "output": _num(v.get("outputTokens")), "cost": round(float(v.get("costUSD") or 0), 6)}
+        if models:
+            for k in USAGE_FIELDS:
+                tot[k] = sum(m[k] for m in models.values())
+            res["models"] = models
+        else:
+            seen = False
+            for r in results:
+                u = r.get("usage") or {}
+                seen = seen or any(k in u for k in ("input_tokens", "output_tokens"))
+                tot["input"] += _num(u.get("input_tokens"))
+                tot["cache_read"] += _num(u.get("cache_read_input_tokens"))
+                tot["cache_write"] += _num(u.get("cache_creation_input_tokens"))
+                tot["output"] += _num(u.get("output_tokens"))
+            if not seen:
+                return None
+        cost = last.get("total_cost_usd")
+        res.update(cost=round(float(cost), 6) if isinstance(cost, (int, float)) else None,
+                   turns=sum(_num(r.get("num_turns")) for r in results), session=last.get("session_id"),
+                   partial=bool(last.get("usage_partial")))
+    elif harness == "codex":
+        done = [e for e in events if e.get("type") == "turn.completed" and isinstance(e.get("usage"), dict)]
+        if not done:
+            return None
+        u = done[-1]["usage"]
+        cached = _num(u.get("cached_input_tokens"))
+        tot.update(input=max(0, _num(u.get("input_tokens")) - cached), cache_read=cached,
+                   cache_write=_num(u.get("cache_write_input_tokens")), output=_num(u.get("output_tokens")))
+        res.update(turns=len(done), cumulative=True,
+                   session=next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), None))
+    elif harness == "agy":
+        done = [e for e in events if isinstance(e.get("usage"), dict) and ("status" in e or "conversation_id" in e)]
+        if not done:
+            return None
+        u = done[-1]["usage"]
+        tot.update(input=_num(u.get("input_tokens")), cache_read=_num(u.get("cache_read_tokens")),
+                   output=_num(u.get("output_tokens")))
+        res.update(turns=_num(done[-1].get("num_turns")) or None, session=done[-1].get("conversation_id") or None)
+    elif harness == "opencode":
+        steps: dict = {}
+        for e in events:
+            part = e.get("part") if isinstance(e.get("part"), dict) else e
+            t = part.get("tokens")
+            if isinstance(t, dict) and ("input" in t or "output" in t):
+                steps[part.get("id") or len(steps)] = (t, part.get("cost"))
+            res["session"] = res["session"] or e.get("sessionID") or part.get("sessionID")
+        if not steps:
+            return None
+        cost = 0.0
+        for t, c in steps.values():
+            cache = t.get("cache") if isinstance(t.get("cache"), dict) else {}
+            tot["input"] += _num(t.get("input"))
+            tot["output"] += _num(t.get("output")) + _num(t.get("reasoning"))
+            tot["cache_read"] += _num(cache.get("read"))
+            tot["cache_write"] += _num(cache.get("write"))
+            cost += float(c) if isinstance(c, (int, float)) else 0.0
+        res.update(cost=round(cost, 6), turns=len(steps))
+    else:
+        return None
+    return {**tot, **res}
+
+
+def plan_marks(ad: Path, agent: str) -> dict:
+    """Status mark of every plan step the agent can change: {(file, step id): mark} over the roadmap and its PLAN."""
+    out = {}
+    for rel in ("planning/ROADMAP.md", f"team/{agent}/PLAN.md"):
+        try:
+            text = (ad / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in STEP_MARK_RE.finditer(text):
+            out[(rel, m[2])] = m[1]
+    return out
+
+
+def run_summary_entry(ad: Path, agent: str, started: float) -> tuple[str | None, str]:
+    """→ (status, text) of the newest SUMMARY entry the agent wrote since the run began; (None, "") without one.
+    Entries added by artel itself (`· system`) do not count."""
+    own = ad / "team" / agent / "SUMMARY.md"
+    path = own if own.exists() else ad / "planning" / "SUMMARY.md"
+    try:
+        entries = summary_entries(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None, ""
+    since = dt.datetime.fromtimestamp(started).astimezone().replace(second=0, microsecond=0)
+    for ts, part in reversed(entries):
+        if ts < since:
+            break
+        head, _, body = part.partition("\n")
+        if re.search(r"·\s*system\s*$", head):
+            continue
+        m = re.search(r"·\s*(" + "|".join(RUN_STATUSES) + r")\b", head)
+        return (m[1] if m else None), body
+    return None, ""
+
+
+def run_outcome(kill_reason: str | None, rc: int | None, status: str | None, entry: str, changed: list) -> str:
+    """advanced | noop | blocked | failed | killed. A run that exits zero and leaves neither a changed step mark nor a
+    SUMMARY entry about work done is `noop`."""
+    if kill_reason:
+        return "killed"
+    if rc != 0 or status == "failed":
+        return "failed"
+    if status == "blocked":
+        return "blocked"
+    if changed or (status in ("done", "partial") and not NO_WORK_RE.search(entry)):
+        return "advanced"
+    return "noop"
+
+
+def run_record(ad: Path, agent: str, task: str | None, harness: str, a_def: dict, started: float, duration_sec: int,
+               rc: int | None, kill_reason: str | None, sid: str | None, text: str, resumed: bool,
+               marks_before: dict | None, logfile: Path | None) -> dict:
+    """The runs.jsonl record of one run: who ran on what, how it ended, which steps it touched and what it spent."""
+    status, entry = run_summary_entry(ad, agent, started)
+    after = plan_marks(ad, agent)
+    changed = sorted({k[1] for k in after if after[k] != marks_before.get(k)}) if marks_before is not None else []
+    usage = run_usage(harness, text)
+    model = str(a_def.get("model") or "") or None
+    effort = norm_effort(a_def.get("effort"), harness)
+    if harness == "agy" and model and re.search(r"-(low|medium|high)$", model):   # the slug carries the effort
+        effort = model.rsplit("-", 1)[1]
+    rec: dict = {"ts": iso(dt.datetime.fromtimestamp(started).astimezone()), "agent": agent, "task": task, "harness": harness,
+                 "model": model, "effort": effort,
+                 "session": sid or (usage or {}).get("session"),
+                 "outcome": run_outcome(kill_reason, rc, status, entry, changed), "status": status, "rc": rc,
+                 "duration_sec": duration_sec, "turns": (usage or {}).get("turns")}
+    if kill_reason:
+        rec["kill_reason"] = kill_reason
+    tokens = {k: usage[k] for k in USAGE_FIELDS} if usage else dict.fromkeys(USAGE_FIELDS)
+    if usage and usage["cumulative"]:
+        rec["thread"] = dict(tokens)
+        if resumed:   # the harness reported the whole session: this run is the difference to the previous record
+            prev = next((r["thread"] for r in reversed(jsonl_read(state_dir(ad) / "runs.jsonl"))
+                         if r.get("session") == rec["session"] and isinstance(r.get("thread"), dict)), None)
+            if prev:
+                tokens = {k: max(0, tokens[k] - _num(prev.get(k))) for k in USAGE_FIELDS}
+            else:
+                rec["usage_scope"] = "session"   # earlier runs of the session are not on record: the figures include them
+    rec.update(tokens)
+    rec["cost"] = usage["cost"] if usage else None
+    if usage and usage["partial"]:
+        rec["usage_partial"] = True
+    rec["models"] = (usage["models"] or {model or "default": dict(tokens)}) if usage else None
+    rec["steps"] = sorted(set(changed) | set(STEP_ID_RE.findall(entry)))
+    if logfile is not None:
+        try:
+            rec["log"] = str(logfile.relative_to(ad))
+        except ValueError:
+            rec["log"] = str(logfile)
+    return rec
+
+
+def fmt_tokens(rec: dict) -> str:
+    if rec.get("input") is None:
+        return "tokens unknown"
+    return f"tokens {rec['input'] + rec['cache_write']} in + {rec['cache_read']} cached, {rec['output']} out"
 
 
 # ── run ──
@@ -3276,8 +3539,19 @@ def cmd_run(a) -> None:
             print("# prompt (stdin):", prompt)
         if slot:
             slot.release()
+        if getattr(a, "replay_log", None):   # read a saved run log the way a finished run is read; nothing is written
+            replay = expand(a.replay_log)
+            text = replay.read_text(encoding="utf-8", errors="replace")
+            m = re.match(r"# (\d{4}-\d{2}-\d{2} \d{2}:\d{2})", text)
+            began = dt.datetime.strptime(m[1], "%Y-%m-%d %H:%M").timestamp() if m else replay.stat().st_mtime
+            m = SESSION_RE.search(text)
+            rec = run_record(ad, name, task, harness, a_def, began, 0, 0, None, m.group(1) if m else None, text,
+                             bool(resume), None, None)
+            print("# record for state/runs.jsonl (not written):")
+            print(json.dumps(rec, ensure_ascii=False))
         return
 
+    marks_before = plan_marks(ad, name)
     logs = state_dir(ad) / "logs" / name
     logs.mkdir(parents=True, exist_ok=True)
     logfile = logs / (f"{dt.datetime.now():%Y-%m-%d_%H-%M-%S}" + (f"_{task}" if task else "") + ".log")
@@ -3341,6 +3615,14 @@ def cmd_run(a) -> None:
     if sid:
         sess_map[name] = sid
         atomic_write(sessions, json.dumps(sess_map, ensure_ascii=False, indent=1))
+    spent = ""
+    try:   # telemetry never decides the fate of a run
+        rec = run_record(ad, name, task, harness, a_def, started, int(dur_min * 60), proc.returncode if proc else None,
+                         kill_reason, sid, text, bool(resume), marks_before, logfile)
+        jsonl_append(state_dir(ad) / "runs.jsonl", rec)
+        spent = f" · {rec['outcome']} · {fmt_tokens(rec)}"
+    except Exception as e:  # noqa: BLE001
+        journal_write(ad, name, "problem", f"run record was not written to state/runs.jsonl: {type(e).__name__}: {e}")
     if proc is None:
         if slot:
             slot.record({"event": "end", "agent": name, "task": task, "outcome": "error", "duration_sec": 0})
@@ -3368,7 +3650,7 @@ def cmd_run(a) -> None:
     commit_res = team_commit(ad, s, f"artel: {key} run {human()} · {outcome}")
     if commit_res.startswith("error"):
         journal_write(ad, name, "problem", f"user project directory commit failed: {commit_res}")
-    print(f"artel run: {key} · {outcome} · {dur_min:.1f}m · log {logfile}" + (f" · git {commit_res}" if commit_res != "disabled" else ""))
+    print(f"artel run: {key} · {outcome}{spent} · {dur_min:.1f}m · log {logfile}" + (f" · git {commit_res}" if commit_res != "disabled" else ""))
     if outcome != "ok":
         sys.exit(1 if outcome == "error" else EXIT_TIMEOUT)
 
@@ -4057,6 +4339,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dry-run", action="store_true", help="show the command and substitutions; do not run")
     sp.add_argument("--force", action="store_true", help="run even if the agent was paused after three consecutive failures; reset the count")
     sp.add_argument("--task", help="task from the agent identity's Tasks section (required when the agent has multiple tasks)")
+    sp.add_argument("--replay-log", metavar="FILE", help="with --dry-run: read a saved run log and print the state/runs.jsonl record artel derives from it")
     sp.set_defaults(fn=cmd_run)
 
     sp = sub.add_parser("commit", help="commit the user project: agents/ to its git, then the root (submodule pointers, skills/, goal.md)")

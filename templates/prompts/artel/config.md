@@ -130,6 +130,7 @@ Substitutions in `prompt`: `{{TASK}}`, `{{WINDOW_END}}` (HH:MM at the end of the
   --print-timeout <hard_limit>s --model M` (with `session: continue`, also `--conversation <id>`; agy effort is
   built into the model name, and `xhigh` and `max` collapse to `high`).
 - opencode: `opencode run <prompt> --format json --auto --dir <cwd> --variant E -m M [--agent A] [--session <id>]`.
+  This is the opencode 1.x form; opencode 2.1 rejects `--dir` and `--variant` (todo.md, step 03-08).
 - `kind: service` with `remote_control: true`: `claude --remote-control <name> --name <name> --model M --effort E
   --dangerously-skip-permissions --strict-mcp-config [--mcp-config <files>] --append-system-prompt-file <file>
   "<prompt>"` in the tmux session
@@ -144,8 +145,29 @@ Substitutions in `prompt`: `{{TASK}}`, `{{WINDOW_END}}` (HH:MM at the end of the
 Task selection (`--task`, otherwise `task`, otherwise the sole item in `tasks`), prepare script, slot queue,
 substitutions, harness launch, log at `agents/state/logs/<agent>/<date>[_<task>].log`, hard limit (SIGTERM, then
 SIGKILL of the entire group after 30 s), entry in `state/slots/<slot>/history.jsonl`, a journal and
-`team/<agent>/SUMMARY.md` entry with status `failed` when killed, and a commit of the user project.
-`artel run <agent> [--task name] --dry-run` shows the command and substitutions without starting it.
+`team/<agent>/SUMMARY.md` entry with status `failed` when killed, one record in `state/runs.jsonl`, and a commit
+of the user project. `artel run <agent> [--task name] --dry-run` shows the command and substitutions without
+starting it.
+
+### Run records
+Every run that reached the harness appends one JSON line to `agents/state/runs.jsonl`; a run cancelled by its
+prepare script leaves none. Read it with `jq` or a script instead of opening logs.
+
+| field | meaning |
+|---|---|
+| `ts`, `agent`, `task`, `harness`, `model`, `effort`, `session`, `log` | when and what ran; `log` is relative to `agents/` |
+| `outcome` | `advanced` (a step mark changed in ROADMAP or the agent's PLAN, or a `done`/`partial` SUMMARY entry about work), `noop` (exit 0 with neither, or an entry saying "no work"), `blocked` (SUMMARY entry `blocked`), `failed` (non-zero exit or entry `failed`), `killed` (hard limit or external stop; `kill_reason` says which) |
+| `status`, `rc`, `duration_sec` | status of the agent's SUMMARY entry of this run or null, harness exit code, seconds |
+| `steps` | step ids whose mark the run changed, plus the ids named in its SUMMARY entry |
+| `input`, `cache_read`, `cache_write`, `output` | tokens of this run, normalised across harnesses: `input` is read at full price, `output` includes reasoning; null when the log holds no usage (a `cmd` with another output, a run killed before the harness reported) |
+| `cost` | list price in USD where the harness reports one (claude, opencode), else null |
+| `turns` | as the harness counts them; not comparable across harnesses |
+| `models` | spend per model; claude lists every model the run used, so a sub-agent on another model is a second entry |
+| `thread` | codex only: totals of the whole session, which is what codex reports; a resumed run is recorded as the difference to the previous record of the session, and `usage_scope: session` marks a record for which no previous one exists |
+| `usage_partial` | claude only: the run ended without a result and the figures are those of the responses seen, with output understated |
+
+`artel run <agent> --dry-run --replay-log <file>` prints the record artel reads from a saved log without writing
+it: the check to run when a harness update changes its output.
 
 ## Checks after registration
 ```bash
