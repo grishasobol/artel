@@ -63,6 +63,8 @@ snapshot/history and the "2-3 reversible changes per iteration" rule.
   secret check on commit, plan review, health check
 - [~] 13 · Consilium run by a driver script: operator outside the discussion, one session per participant
   (since 2026-11-13; skill, driver and mock test done, checks on a Linux installation open)
+- [ ] 14 · Run guards and on-demand context ported from OpenHands: repetition guard, token budget and spend
+  by model, path-scoped modules, failover harness, recipe for external events
 
 ### Phase 1 · Publication readiness
 Goal: every file in the repository is in English, consistent with the others, free of personal data and of
@@ -551,6 +553,67 @@ call recovered it (`VOTE: OBJECT`). No participant failed or timed out in any of
 second full run (13-07) the lead's checkpoint report after two circles was accurate ("converging, one editorial
 disagreement"), and `hurry` ended the consilium in the next circle with both approvals.
 
+### Phase 14 · Run guards and on-demand context ported from OpenHands
+Goal: a run that repeats itself or overspends is stopped by artel and not by the next super iteration, a run
+that fails on an exhausted subscription continues on another one, and project knowledge reaches a run only
+when its task touches the matching files.
+Source: `docs/research/09-openhands.md` (section 4). Nothing is copied: OpenHands guards a loop of model calls
+through its event log, artel guards harness runs through `runs.jsonl` and the harness stream.
+Depends on: 06-01 for 14-01, 14-02, 14-04 and 14-05; 05-01 for 14-06; nothing for 14-03 and 14-07.
+Success criteria:
+- An agent whose runs keep ending `blocked` or `noop` on the same steps is paused with an escalation, the way
+  three failed runs pause it today.
+- A run whose harness stream repeats one tool call with one result, or exceeds the task's `max_tokens`, ends
+  as `killed` with the reason in the journal, on each harness whose stream artel reads.
+- `runs.jsonl` holds spend per model of a run, and `artel stats` flags a run in which a model above the cheap
+  tier appears next to the agent's own model.
+- A task with `fallback:` that fails on a rate limit or an exhausted window is rerun once on the fallback
+  harness; a login failure is not.
+- A project module with `paths:` appears in the brief only for a task whose steps name matching paths.
+Steps:
+- [ ] 14-01 · lead · Repetition guard across runs in `cmd_run`: the last N records of the same agent and task
+      in `runs.jsonl` with outcome `blocked` or `noop` and the same step ids (N from `repeat_pause`, default 3)
+      pause the agent through the failure-streak mechanism, with an escalation naming the steps; `--force`
+      clears it. Done when: on the mock three replayed `blocked` records on one step skip the fourth run with
+      a journal entry `paused`, and a record with another step id in between does not.
+- [ ] 14-02 · lead · Repetition guard inside a run: while reading the harness stream, `cmd_run` counts
+      consecutive tool calls equal in name and arguments with equal results, and consecutive failures of one
+      call; at `loop_guard` (default 4 identical, 4 failing, off with 0) it ends the run as `killed` with the
+      pattern and the call in the journal. Done when: a replayed fixture stream with four identical
+      call-result pairs is killed and one with three is not, for claude and codex; the harnesses whose stream
+      does not expose tool calls are named in `artel/config`.
+- [ ] 14-03 · lead · Repetition notice in the consilium driver: the same voter objecting to two finals in a
+      row, or a circle whose messages equal the previous circle's after whitespace folding, raises a
+      `checkpoint` event at once with the pattern named in the notice; the driver ends nothing itself. Done
+      when: `tests/consilium-smoke.sh` has a check where a mock voter objects twice and the operator gets the
+      checkpoint before the configured circle count.
+- [ ] 14-04 · lead · `max_tokens` on an agent or task: the sum of input, cache-read and output tokens from the
+      usage records of the stream, compared after each record; over the limit the run ends as `killed` with
+      the figure in the journal. `artel/config` states that `max_budget_usd` stays claude-only and that
+      `max_tokens` works wherever 06-01 reads usage. Done when: a replayed fixture exceeding the limit is
+      killed at the first record over it, for each harness with a fixture.
+- [ ] 14-05 · worker · Spend by model: `runs.jsonl` records a `models` map (claude: `modelUsage` of the result
+      message, checked on 2.1.325; the other harnesses: the one model of the run); `artel stats` flags a run
+      whose map holds a second model outside the cheap tier of `charter.md`. Done when: a fixture result with
+      two models, one of them strong, is flagged and a fixture with a sonnet sub-agent is not.
+- [ ] 14-06 · lead · Path-scoped project modules: a module in `agents/prompts/` may carry `paths:` globs in
+      its frontmatter; `artel brief` (05-01) names such a module only when a path written in the agent's
+      active steps matches, and `artel prompts status` lists identities that still inline a path-scoped
+      module. `artel/plan` says a step names the paths it touches; `agent-prompt.md` tells a run to read the
+      modules named in its brief. Done when: on the mock a module with `paths: src/db/**` is in the brief of
+      an agent whose active step names `src/db/schema.sql` and absent for an agent without such a step.
+- [ ] 14-07 · lead · Failover harness: a task or agent may set `fallback:` (harness, model, effort); when the
+      run fails with a rate-limit or exhausted-window error of its harness, or the quota snapshot puts the
+      harness over the project's threshold before the start, `cmd_run` runs the task once on the fallback and
+      records the harness that did the work; a login failure still goes to the user and is never retried; the
+      next scheduled run starts from the primary. The error patterns per harness go into `harness/*.md`. Done
+      when: on the mock a stub harness exiting with the recorded rate-limit text triggers one fallback run,
+      and a stub exiting with the login text triggers none.
+- [ ] 14-08 · worker · `artel/config` section "Runs on external events": a `prepare` script as poller and
+      filter that exits 3 when nothing matched, and a spool directory under `watch_paths` (08-01) for pushes
+      delivered from outside; no webhook server in the container. Done when: grep finds the section and the
+      template `config.yaml` has a commented example of each.
+
 ## Deferred and cancelled
 | item | reason |
 |---|---|
@@ -569,4 +632,8 @@ disagreement"), and `hurry` ended the consilium in the next circle with both app
 | Git merge driver that unions appended JSONL lines (gstack `bin/gstack-jsonl-merge`) | deferred 2026-11-13: `agents/` has one writer branch in one container; revisit if projects get parallel working copies |
 | Caps on the number of turns, question batches or research rounds built into the consilium driver | rejected by the user 2026-11-13: the operator sets limits per task and steers at checkpoints; the driver only guards against hanging (working time, turn time) |
 | The convener of a consilium as its chair and participant (the previous `procedures/consilium`) | replaced 2026-11-13 (phase 13): the chair paid for the whole discussion in its own context; the operator now reads only events |
+| Rebuilding artel on OpenHands, or running harnesses through its agent server | rejected 2026-11-13 (report 09, section 3): for an ACP agent its condenser, tools, MCP and critic are switched off and permissions are auto-granted; what remains is a transport bought with a server daemon and `npx` adapters |
+| ACP as the single transport to all four harnesses | deferred 2026-11-13 (report 09): one usage format instead of four parsers, but claude and codex need third-party adapters and pass-through of harness flags (`--strict-mcp-config`, tool list, effort) is unknown; revisit if the parsers of 06-01 prove costly to maintain |
+| Checkpoint report of the consilium lead asked in a forked session | deferred 2026-11-13 (report 09): claude and codex can fork a session, agy cannot; the gain is a six-line report kept out of the lead's context |
+| Inline risk rating of every action with a confirmation policy (OpenHands security analyzer) | rejected 2026-11-13 (report 09): artel does not own the harness tool schemas and runs are unattended; phase 12 covers it with one-way doors and the write guard |
 | Context caching across runs via `session: continue` | deferred: never tried on a live project; the brief keeps fresh sessions small instead; measure in 06-05 before deciding |
