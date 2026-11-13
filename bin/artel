@@ -13,6 +13,7 @@ Commands:
   link       update skills/* and AGENTS.md symlinks in all harness skill and rules directories
   skills     compare the project's skills/ with artel templates: update or remove untouched copies (--apply), show changes
   prompts    prompt library: list | show <module> | status (which identities have changed sources)
+  update     keep artel/ at the latest release of its origin: check | --apply (move, self-check, review report) | --done
   env        environment overview (CLI, versions, models, scheduler) in Markdown
   quota      quota snapshot (cache under 10 min old, --fresh to poll): claude, agy, codex via app-server, opencode by provider
   notify     message the user without waiting for a reply
@@ -644,6 +645,323 @@ def cmd_prompts(a) -> None:
             print(f"- {agent}: compiled at {base}; " + "; ".join(parts))
 
 
+# ── update: artel/ follows the releases of its origin ──
+
+RELEASE_TAG_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")   # a release is a tag vMAJOR.MINOR.PATCH in the origin of the artel clone
+UPDATE_AREAS = (("command", ("bin/",)), ("charter", ("charter.md",)), ("prompt library", ("templates/prompts/",)),
+                ("skill templates", ("templates/skills/",)), ("project templates", ("templates/",)),
+                ("install scripts", ("install/",)))
+UPDATE_REST = "docs, tests and the rest"
+UPDATE_DONE_HINT = 'artel update --done "<adopted; adapted; declined and why; deferred>"'
+
+
+def release_key(tag: str) -> tuple | None:
+    m = RELEASE_TAG_RE.fullmatch(tag.strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def agit(sh: Path, *args: str, timeout: int = 60) -> tuple[bool, str]:
+    """git in the artel clone, never interactive: a missing key or password is a failure, not a prompt.
+    Returns (ok, stdout) on success and (False, stdout + stderr) on failure."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0",
+           "GIT_SSH_COMMAND": os.environ.get("GIT_SSH_COMMAND") or "ssh -oBatchMode=yes"}
+    try:
+        r = subprocess.run(["git", "-C", str(sh), "-c", "protocol.file.allow=always", *args], capture_output=True,
+                           text=True, timeout=timeout, stdin=subprocess.DEVNULL, env=env)
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except FileNotFoundError:
+        return False, "git not found"
+    ok = r.returncode == 0
+    return ok, ((r.stdout or "") if ok else (r.stdout or "") + (r.stderr or "")).strip()
+
+
+def artel_self(sh: Path, ad: Path | None, *args: str, timeout: int = 120) -> tuple[int | None, str]:
+    """Run the artel command of the clone as it is on disk now (after a checkout this is the new release, while
+    this process still runs the old code). Returns (returncode | None on timeout, last lines of its output)."""
+    env = {**os.environ, **({"ARTEL_AD": str(ad)} if ad else {})}
+    try:
+        r = subprocess.run([sys.executable, str(sh / "bin" / "artel"), *args], capture_output=True, text=True,
+                           timeout=timeout, stdin=subprocess.DEVNULL, env=env)
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+
+
+def artel_rev(sh: Path, ref: str) -> str:
+    ok, out = agit(sh, "rev-parse", "--verify", "-q", f"{ref}^{{commit}}")
+    return out if ok else ""
+
+
+def artel_releases(sh: Path) -> list[str]:
+    ok, out = agit(sh, "tag", "-l", "v[0-9]*")
+    return sorted((t for t in out.split() if release_key(t)), key=release_key) if ok else []
+
+
+def artel_version(sh: Path, commit: str = "HEAD") -> str:
+    """The release at a commit; otherwise how far past the nearest release it is (git describe); otherwise the short commit."""
+    ok, out = agit(sh, "tag", "--points-at", commit)
+    here = sorted((t for t in out.split() if release_key(t)), key=release_key) if ok else []
+    if here:
+        return here[-1]
+    ok, out = agit(sh, "describe", "--tags", "--match", "v[0-9]*", commit)
+    if ok and out:
+        return out
+    ok, out = agit(sh, "rev-parse", "--short", commit)
+    return out if ok and out else "unknown"
+
+
+def update_follow(s: dict) -> tuple[str, str]:
+    """artel.update in config.yaml → (mode, branch): release (default) | branch:<name> | off.
+    A bare `off` in YAML is the boolean false, so that is accepted too."""
+    raw = cget(s, "update", "release")
+    v = str(raw).strip()
+    if raw is False or v.lower() in ("off", "no", "none"):
+        return "off", ""
+    if raw is True or v == "release":
+        return "release", ""
+    if v.startswith("branch:") and v.split(":", 1)[1].strip():
+        return "branch", v.split(":", 1)[1].strip()
+    die(f"config.yaml: artel.update is {v!r}; expected release, branch:<name> or off", EXIT_CFG)
+    raise SystemExit
+
+
+def update_target(sh: Path, mode: str, branch: str, to: str | None) -> tuple[str, str]:
+    """What artel/ should be at → (label, commit); ('', '') when there is nothing to follow.
+    --to names a branch of origin, a tag or a commit; the word `release` means the latest release."""
+    if to and to != "release":
+        for ref in (f"refs/remotes/origin/{to}", f"refs/tags/{to}", to):
+            c = artel_rev(sh, ref)
+            if c:
+                return to, c
+        die(f"update: {to} is not a branch of origin, a tag or a commit in {sh}")
+    if to == "release" or mode == "release":
+        rel = artel_releases(sh)
+        return (rel[-1], artel_rev(sh, f"refs/tags/{rel[-1]}")) if rel else ("", "")
+    if mode == "branch":
+        c = artel_rev(sh, f"refs/remotes/origin/{branch}")
+        if not c:
+            die(f"update: origin has no branch {branch} (artel.update in config.yaml)")
+        return f"origin/{branch}", c
+    return "", ""
+
+
+def update_state_path(ad: Path) -> Path:
+    return state_dir(ad) / "artel-update.json"
+
+
+def update_state_read(ad: Path) -> dict:
+    try:
+        d = json.loads(update_state_path(ad).read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def update_state_write(ad: Path, st: dict) -> None:
+    atomic_write(update_state_path(ad), json.dumps(st, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+
+
+def changelog_sections(text: str, old_key: tuple | None, new_key: tuple | None) -> str:
+    """Sections of CHANGELOG.md (`## vX.Y.Z …` headings) for releases after old_key up to new_key. With new_key None
+    the target is not a release: every later release and the `## Unreleased` section are included."""
+    out: list[str] = []
+    for sec in re.split(r"(?m)^(?=## )", text):
+        if not sec.startswith("## "):
+            continue
+        head = sec.splitlines()[0]
+        m = RELEASE_TAG_RE.search(head)
+        key = tuple(int(x) for x in m.groups()) if m else None
+        if key is None:
+            take = new_key is None and "unreleased" in head.lower()
+        else:
+            take = (old_key is None or key > old_key) and (new_key is None or key <= new_key)
+        if take and sec.strip() != head.strip():
+            out.append(sec.rstrip())
+    return "\n\n".join(out)
+
+
+def update_report(sh: Path, ad: Path | None, old: str, new: str, head_line: str) -> str:
+    """What a move of artel/ from commit old to commit new brought: release notes, changed files by area, and what
+    that touches in this project. Printed after --apply and again by every check until the review is closed."""
+    lines = [head_line, "", "## Release notes (CHANGELOG.md)"]
+    ok, base = agit(sh, "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", old)
+    ok2, at_new = agit(sh, "tag", "--points-at", new)
+    new_keys = sorted(k for k in (release_key(t) for t in at_new.split()) if k) if ok2 else []
+    ok3, cl = agit(sh, "show", f"{new}:CHANGELOG.md")
+    notes = changelog_sections(cl, release_key(base) if ok else None, new_keys[-1] if new_keys else None) if ok3 else ""
+    lines.append(notes or f"(no section for this range; commits: git -C {sh} log --oneline {old[:7]}..{new[:7]})")
+    areas: dict[str, list[str]] = {}
+    ok, out = agit(sh, "diff", "--numstat", "--no-renames", old, new)
+    for line in out.splitlines() if ok else []:
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        add, dele, path = parts
+        area = next((n for n, pre in UPDATE_AREAS if any(path == p or path.startswith(p) for p in pre)), UPDATE_REST)
+        name = path[len("templates/prompts/"):-3] if area == "prompt library" and path.endswith(".md") else path
+        areas.setdefault(area, []).append(f"{name} (+{add} -{dele})")
+    lines += ["", f"## Changed in artel/ by area (git -C {sh} diff {old[:7]} {new[:7]} -- <path>)"]
+    for area in [n for n, _ in UPDATE_AREAS]:
+        items = areas.get(area)
+        if items:
+            lines.append(f"- {area}: " + ", ".join(items[:15]) + (f", and {len(items) - 15} more" if len(items) > 15 else ""))
+    if areas.get(UPDATE_REST):
+        lines.append(f"- {UPDATE_REST}: {len(areas[UPDATE_REST])} files that a running project does not read")
+    if not areas:
+        lines.append("- nothing")
+    if ad:
+        for title, args in (("Identities and their sources (artel prompts status)", ("prompts", "status")),
+                            ("Skill copies in skills/ (artel skills, dry run)", ("skills",))):
+            rc, out = artel_self(sh, ad, *args)
+            lines += ["", f"## {title}", out if rc == 0 else f"(`artel {' '.join(args)}` exits {rc}: {out[-300:]})"]
+        lines += ["", "## Next", "The command, the charter and the prompt library are already the new ones; nothing in agents/ or "
+                  "skills/ was changed.", "Decide for each change whether this project adopts it, apply what it does, then close the review:",
+                  f"  {UPDATE_DONE_HINT}"]
+    return "\n".join(lines)
+
+
+def update_selfcheck(sh: Path, ad: Path | None, project: bool = True) -> tuple[bool, str]:
+    """Whether the artel command on disk starts and, when asked, still reads this project's configuration."""
+    rc, out = artel_self(sh, ad, "help")
+    if rc != 0:
+        return False, f"`artel help` exits {rc}: {out[-300:]}"
+    if ad and project:
+        rc, out = artel_self(sh, ad, "schedule", "--no-systemd")
+        if rc != 0:
+            return False, f"`artel schedule` exits {rc}: {out[-300:]}"
+    return True, ""
+
+
+def cmd_update(a) -> None:
+    """Keep artel/ at the latest release of its origin. Without flags: fetch and say what is installed, what is
+    available and whether an applied update still waits for review. --apply moves artel/ to the target (a detached
+    checkout), checks that the new command starts and reads this project, returns to the previous commit when it
+    does not, and prints the review report. --done closes the review with the decisions taken. The command never
+    touches agents/ or skills/: what a project adopts from a release is the super agent's decision.
+    Works without a user project too (the installer runs it on a fresh clone before `artel init`)."""
+    sh = artel_home()
+    ad = find_ad() if os.environ.get("ARTEL_AD") else next(
+        (d / "agents" for d in [Path.cwd().resolve(), *Path.cwd().resolve().parents] if (d / "agents" / "config.yaml").exists()), None)
+    s = load_cfg(ad)[1] if ad else {}
+    st = update_state_read(ad) if ad else {}
+    who = agent_name(a)
+    prev, inst = st.get("previous") or {}, st.get("installed") or {}
+    pending = st.get("review") == "pending" and bool(prev.get("commit")) and bool(inst.get("commit"))
+
+    def pending_report() -> str:
+        return update_report(sh, ad, prev["commit"], inst["commit"],
+                             f"# artel update · {prev.get('ref')} ({prev['commit'][:7]}) -> {inst.get('ref')} ({inst['commit'][:7]})"
+                             f" · applied {st.get('applied', '?')} · review pending")
+
+    if a.done is not None:
+        if not ad:
+            die("update --done needs a user project (agents/config.yaml)", EXIT_CFG)
+        if not pending:
+            die("no applied update is waiting for review")
+        text = a.done.strip()
+        if not text:
+            die(f"say what was decided: {UPDATE_DONE_HINT}")
+        st.update(review="done", reviewed=iso(), decision=text)
+        update_state_write(ad, st)
+        journal_write(ad, who, "artel-update", f"review of {prev.get('ref')} -> {inst.get('ref')} closed: {text}")
+        print(f"artel update: review of {prev.get('ref')} -> {inst.get('ref')} closed")
+        return
+
+    if not artel_rev(sh, "HEAD"):
+        die(f"{sh} is not a git clone: there is nothing for artel update to follow", EXIT_CFG)
+    mode, branch = update_follow(s)
+    head, cur = artel_rev(sh, "HEAD"), artel_version(sh)
+    has_origin, url = agit(sh, "remote", "get-url", "origin")
+    follows = {"release": "releases", "branch": f"branch {branch}", "off": "nothing (artel.update: off)"}[mode]
+    line0 = f"artel {cur} ({head[:7]}) · follows {follows} of {url if has_origin else 'no origin'}"
+    if (mode == "off" and not a.to) or not has_origin:
+        if a.apply:
+            die("update: " + ("the artel clone has no origin remote" if not has_origin else "updates are off in config.yaml; name a target with --to <ref>"))
+        print(line0 + "\n" + ("updates are off" if has_origin else "no origin remote: updates cannot be followed"))
+        if pending:
+            print("\n" + pending_report())
+        return
+    ok, out = agit(sh, "fetch", "-q", "--tags", "--force", "origin", timeout=180)
+    if not ok:
+        print(line0)
+        if pending:
+            print("\n" + pending_report() + "\n")
+        die(f"update: cannot fetch origin: {out[-300:]}")
+    label, target = update_target(sh, mode, branch, a.to)
+    if not target:
+        print(line0 + "\norigin has no release tags (vMAJOR.MINOR.PATCH): staying on the installed commit")
+        return
+    ok, out = agit(sh, "rev-list", "--count", "HEAD", "--not", "--remotes", "--tags")
+    local = int(out) if ok and out.isdigit() else 0
+    ok, out = agit(sh, "status", "--porcelain", "--untracked-files=no")
+    dirty = out.splitlines() if ok else []
+    contained = agit(sh, "merge-base", "--is-ancestor", target, head)[0]
+    behind = target != head and (bool(a.to) or not contained)
+    failed = st.get("failed") or {}
+    blocked = ""
+    if dirty:
+        blocked = (f"artel/ has uncommitted changes ({', '.join(d.split(None, 1)[-1] for d in dirty[:8])}{', …' if len(dirty) > 8 else ''}): "
+                   f"commit them in {sh} to keep them or discard them, then apply again")
+    elif local:
+        blocked = (f"artel/ carries {local} local commit(s) that origin does not have (git -C {sh} log --oneline --not --remotes --tags HEAD): "
+                   f"carry them onto the target by hand (git -C {sh} rebase {label}) or stay on the installed version")
+    elif not a.to and failed.get("commit") == target:
+        blocked = (f"{label} failed its self-check here on {failed.get('at', '?')} ({failed.get('why', '?')}) and was rolled back; "
+                   f"it is not retried by itself: artel update --apply --to {label}")
+
+    if not a.apply:
+        if ad:
+            st.update(checked=iso(), available={"ref": label, "commit": target} if behind else None)
+            update_state_write(ad, st)
+        print(line0)
+        if not behind:
+            print("up to date" + (f": installed is ahead of {label}" if target != head else ""))
+        else:
+            ok, n = agit(sh, "rev-list", "--count", f"{head}..{target}")
+            print(f"update available: {label} ({target[:7]}), {n if ok else '?'} commit(s) ahead of installed; apply: artel update --apply")
+            if blocked:
+                print(f"blocked: {blocked}")
+        if pending:
+            print("\n" + pending_report())
+        return
+
+    if not behind:
+        print(line0 + "\nup to date" + (f": installed is ahead of {label}" if target != head else ""))
+        if pending:
+            print("\n" + pending_report())
+        return
+    if blocked:
+        print(line0, file=sys.stderr)
+        die(f"update to {label} not applied: {blocked}")
+    ok, on_branch = agit(sh, "symbolic-ref", "-q", "--short", "HEAD")
+    back = on_branch if ok and on_branch else head
+    project_ok = update_selfcheck(sh, ad)[0] if ad else False
+    ok, out = agit(sh, "checkout", "-q", "--detach", target)
+    if not ok:
+        die(f"update: checkout of {label} failed, artel/ left at {cur}: {out[-300:]}")
+    ok, why = update_selfcheck(sh, ad, project=project_ok)
+    if not ok:
+        rb, rb_out = agit(sh, "checkout", "-q", back)
+        rolled = f"rolled back to {cur}" if rb else f"ROLLBACK FAILED, restore by hand: git -C {sh} checkout {back} ({rb_out[-200:]})"
+        if ad:
+            st["failed"] = {"ref": label, "commit": target, "at": iso(), "why": why}
+            update_state_write(ad, st)
+            journal_write(ad, who, "artel-update", f"update {cur} -> {label} failed its self-check ({why}); {rolled}")
+        die(f"update to {label} failed its self-check ({why}); {rolled}")
+    new_ver = artel_version(sh)
+    if not ad:
+        print(f"artel {cur} ({head[:7]}) -> {new_ver} ({target[:7]})")
+        return
+    start = prev if pending else {"ref": cur, "commit": head}   # an unreviewed earlier update stays inside the review range
+    st = {k: v for k, v in st.items() if k not in ("failed", "reviewed", "decision")}
+    st.update(previous=start, installed={"ref": new_ver, "commit": target}, applied=iso(), review="pending", available=None)
+    update_state_write(ad, st)
+    journal_write(ad, who, "artel-update", f"artel/ moved {cur} ({head[:7]}) -> {new_ver} ({target[:7]}); review pending (artel update)")
+    print(update_report(sh, ad, start["commit"], target,
+                        f"# artel update · {start.get('ref')} ({start['commit'][:7]}) -> {new_ver} ({target[:7]}) · applied {st['applied']} · review pending"))
+
+
 def cmd_init(a) -> None:
     """Lay out the user project root (usually /home/artel): a git repository with artel and agents submodules,
     skills/ symlinked into every harness, AGENTS.md, and goal.md. A repeated run overwrites nothing."""
@@ -656,7 +974,7 @@ def cmd_init(a) -> None:
         die(f"artel command is in {sh}, but project root is {root}: the artel repository must be the {root / 'artel'} submodule\n"
             f"(clone it there and run {root / 'artel/bin/artel'} init; or use --force if this is intentional)", EXIT_CFG)
     tpl = sh / "templates"
-    mapping = {"PROJECT": project, "PROJECT_DIR": str(root), "ARTEL_HOME": str(sh),
+    mapping = {"PROJECT": project, "PROJECT_DIR": str(root), "ARTEL_HOME": str(sh), "ARTEL_UPDATE": a.update or "release",
                "DATE": now().strftime("%Y-%m-%d"), "GOAL_SUMMARY": "(filled in by the installer with the user)"}
     log: list[str] = []
 
@@ -708,7 +1026,7 @@ def cmd_init(a) -> None:
                  "  artel command not in PATH yet: open a new shell (PATH line added to ~/.profile and ~/.bashrc)\n" if path_lines else
                  f"  artel command not in PATH: export PATH={sh / 'bin'}:$PATH\n")
     print(f"\nDone: {root}\n  goal.md       project goal (written by the user with the installer)\n  agents/       plans, journal, config, prompts (its own git)\n"
-          f"  skills/       super (/super) and consilium (/consilium) skills, linked into every harness (artel link updates links)\n  artel/        artel system (submodule, update: git -C artel pull); prompt library templates/prompts (artel prompts)\n"
+          f"  skills/       super (/super) and consilium (/consilium) skills, linked into every harness (artel link updates links)\n  artel/        artel system (submodule at a release of its origin; artel update); prompt library templates/prompts (artel prompts)\n"
           f"  src/          project repositories (submodules or mounts)\n" + path_hint)
 
 
@@ -757,7 +1075,7 @@ def cmd_cheatsheet(a) -> None:
         ("pause", f"systemctl --user stop '{c}-*.timer'", "resume: artel register --apply"),
         ("stop all", "artel unregister", "back: artel register --apply"),
         ("goal", "edit goal.md, then /super \"goal.md changed\"", "or a message in the channel"),
-        ("update", "git -C ~/artel pull && artel skills --apply", "then artel prompts status"),
+        ("update", "artel update · artel update --apply", "artel releases; super does this in its runs"),
         ("snapshot", f"incus snapshot create|restore|list {c} [<name>]", "rollback point"),
         ("container", f"incus stop|start {c} · incus delete -f {c}", "the project lives inside"),
         ("logins", f"install/auth-transfer.sh {c} --check", "per harness, from the host clone"),
@@ -1459,7 +1777,7 @@ def cmd_env(a) -> None:
     lines.append(f"- inter-process signals: {why}")
     sh = artel_home()
     rc, so, _ = run_bin(["git", "-C", str(sh), "rev-parse", "--short", "HEAD"], timeout=15)
-    lines.append(f"- artel: {sh}" + (f" (commit {so.strip()})" if rc == 0 and so.strip() else "")
+    lines.append(f"- artel: {sh}" + (f" ({artel_version(sh)}, commit {so.strip()})" if rc == 0 and so.strip() else "")
                  + (", in PATH" if shutil.which("artel") else ", NOT in PATH: export PATH=" + str(sh / "bin") + ":$PATH"))
     lines += ["", "## User project directory"]
     try:
@@ -4353,7 +4671,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--artel-url", help="artel submodule URL (default: its clone's origin or ./artel)")
     sp.add_argument("--src", action="append", help="project repository URL, becomes src/<name> submodule; may be repeated")
     sp.add_argument("--force", action="store_true", help="do not require artel to be a root submodule")
+    sp.add_argument("--update", metavar="MODE", help="what artel/ follows, written to a new config.yaml: release (default) | branch:<name> | off")
     sp.set_defaults(fn=cmd_init)
+
+    sp = sub.add_parser("update", help="keep artel/ at the latest release of its origin; without flags: check and report")
+    sp.add_argument("--check", action="store_true", help="fetch origin and report installed, available and a pending review (the default)")
+    sp.add_argument("--apply", action="store_true", help="move artel/ to the target, self-check, roll back on failure, print the review report")
+    sp.add_argument("--to", metavar="REF", help="target instead of the followed one: release | a tag | a branch of origin | a commit")
+    sp.add_argument("--done", nargs="?", const="", metavar="TEXT", help="close the review of the applied update with the decisions taken")
+    sp.add_argument("--agent")
+    sp.set_defaults(fn=cmd_update)
 
     sp = sub.add_parser("link", help="update skills/* and AGENTS.md symlinks in all harness directories")
     sp.set_defaults(fn=cmd_link)

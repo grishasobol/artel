@@ -19,7 +19,17 @@ Who the agent is, what it knows, what it may do, and what each task means live i
 Only environment facts needed by the script: `project`, `git.autocommit` (default `true`: after every completed
 timer run, `artel run` commits the user project, `agents/`, and submodule pointers under `src/`, under an interprocess
 lock so agents in different slots do not interfere; services and runs started by a prepare script are not committed),
-`channel.quiet_hours`, `channel.telegram.env_file`, and `channel.telegram.dedicated_bot`. All behavior lives in identities.
+`channel.quiet_hours`, `channel.telegram.env_file`, `channel.telegram.dedicated_bot`, and `update`. All behavior
+lives in identities.
+
+`update` says what the `artel/` directory follows: `release` (default: the latest release of its origin, a tag
+`vMAJOR.MINOR.PATCH`), `branch:<name>` (the head of that branch of the origin), or `off` (nothing moves it; quote
+the word in YAML). `artel update` reads it: without flags it fetches the origin and prints the installed version,
+the available one and the report of an applied update whose review is still open; `--apply` moves `artel/`,
+checks that the new command starts and reads this configuration, and returns to the previous version when it
+does not; `--to <tag|branch|commit>` names a target once, which is how a version is pinned under `off`;
+`--done "<decisions>"` closes the review. The command refuses to move an `artel/` that carries uncommitted changes
+or commits its origin does not have, and never edits `agents/` or `skills/`. State: `agents/state/artel-update.json`.
 
 ## `slots` section
 A slot is a parallelism lane: a directory, a work sphere, and two time values. Agents in one slot never work at the

@@ -15,7 +15,7 @@ repository with submodules.
 | `agents/` | development process: `rules.md`, `planning/`, `team/<name>/`, `journal.md`, `environment.md`, `config.yaml`, identities, `prompts/` (project modules), `escalations/`, `history/`, scripts; its own Git repository | agents under the rules below |
 | `skills/` | `super` skill for invoking the super agent from a live session (`/super`) | the super agent |
 | `src/` | project code: Git submodules and host-mounted directories; all project work happens here, commits from `src/<repository>` | worker agents |
-| `artel/` | the artel system (submodule, `$ARTEL_HOME`): this charter, the `artel` command (in PATH), prompt library, templates | nobody: record a defect or feature request with `artel journal --type artel-issue` |
+| `artel/` | the artel system (submodule, `$ARTEL_HOME`) at a release of its origin: this charter, the `artel` command (in PATH), prompt library, templates | `artel update`, run by the super agent; nobody by hand: record a defect or feature request with `artel journal --type artel-issue` |
 | `scratch/` | drafts, worker worktrees, large data; outside Git | anyone |
 
 ## Ownership principle

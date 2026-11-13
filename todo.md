@@ -49,7 +49,8 @@ snapshot/history and the "2-3 reversible changes per iteration" rule.
 
 ## Phases
 - [~] 1 · Publication readiness (since 2026-10-25)
-- [ ] 2 · Update process without extra tokens (`artel update`, `artel brief`)
+- [~] 2 · Releases and the update process (since 2026-11-13; `artel update`, installation at the latest release
+  and the super skill done; first release, a run in a container and `artel brief` open)
 - [ ] 3 · Live verification of what was only mocked
 - [~] 4 · Public repository hygiene (license, history and rename done; smoke test and contribution notes open)
 - [ ] 5 · Brief and bounded state: `artel brief` as the default prepare for every agent
@@ -111,23 +112,61 @@ Steps:
       identities (`artel prompts status`). Depends on: publication (the author does this step themselves afterwards): the running project's agents
       then read English modules and the super agent must recompile identities. Done when: `artel prompts status` is clean there.
 
-### Phase 2 · Update process without extra tokens
-Goal: the super agent learns whether artel changed, and what, from its run prompt, not from exploratory
-tool calls; the mechanical part of an update needs no model at all.
+### Phase 2 · Releases and the update process
+Goal: a running installation keeps `artel/` at the latest release of its origin by itself. Moving `artel/` needs
+no model; what the project adopts from a release is decided by its super agent, change by change; and the super
+agent learns whether artel changed from one command or its run prompt, not from exploratory tool calls.
 Depends on: phase 1.
 Success criteria:
-- `artel update --check` reports the current and the available commit and the touched areas in under a second.
-- `artel update --apply` fast-forwards the submodule, runs `skills --apply` and `link`, self-checks and rolls back
-  on failure, records old/new commits in `agents/state/artel-update.json`.
-- `artel brief super` prints a block of at most ~10 lines; the super config uses it as `prepare` and `{{PREPARE}}`.
-- `artel prompts diff <module>` shows the change between an identity's base commit and HEAD.
-- The super skill tells a timer run to read the brief and skip the update step when nothing changed.
+- A container created by `install/artel-up.sh` has `artel/` at the latest release of the origin (a tag
+  `vMAJOR.MINOR.PATCH`), and `artel update` there prints that release and "up to date".
+- `artel update` reports the installed and the available release; `--apply` moves `artel/`, self-checks, rolls
+  back on failure and records both versions in `agents/state/artel-update.json`; it changes nothing in
+  `agents/` or `skills/`; `--done` closes the review with the decisions in the journal.
+- The super skill makes a timer run check for a release, apply it, review the report and decide per change.
+- The origin has at least one release, and a container installed from it moves to the next one in a timer run
+  of its super agent, with the decisions visible in `agents/journal.md`.
+- `artel brief super` prints a block of at most ~10 lines, the update line included; the super config uses it as
+  `prepare` and `{{PREPARE}}`. `artel prompts diff <module>` shows the change between an identity's base commit
+  and HEAD.
 Steps:
-- [ ] 02-01 · lead · `artel update --check|--apply|--done` with `artel.update: auto|manual` in config.yaml.
+- [x] 02-01 · lead · `artel update` (check by default, `--apply`, `--to <ref>`, `--done <text>`) with
+      `artel.update: release | branch:<name> | off` in config.yaml and `{{ARTEL_UPDATE}}` in the config template.
+      A release is a tag `vMAJOR.MINOR.PATCH` read through git, not the GitHub API. The command refuses an
+      `artel/` with uncommitted changes or commits its origin lacks, skips a release that failed its self-check,
+      keeps an unreviewed update inside the next review range, and works on a bare clone before `artel init`.
+      (evidence: 2026-11-13, macOS, git 2.56.0, `bash tests/update-smoke.sh` prints `ok 1` to `ok 9` and
+      "all 9 checks passed": installation at the latest release; origin without tags; up to date although
+      origin/main is ahead; a new release reported and recorded; apply with release notes, changed module, stale
+      identity and skill copy while `skills/` stays byte-identical; review repeated until `--done`; broken
+      release rolled back and skipped; local changes and local commits refused; `off`, pinned `--to`,
+      `branch:main`, unknown value. Decision of the user, 2026-11-13: `--apply` does not run `skills --apply`,
+      adoption is the super agent's call.)
+- [x] 02-06 · lead · Super skill: section "Artel releases (part of a timer run)" (the command moves `artel/`;
+      the super agent adopts, adapts, declines or defers each change; where a change lands; closing the review
+      and its done criterion), the "Collection" item that calls `artel update`, the rule that everything artel
+      ships is a default the user may change, and "no update in a live session without a request". The same
+      default rule is in `docs/install.md` part 2, `README.md` and `CLAUDE.md`; `artel/config` documents
+      `artel.update`. (evidence: `grep -n "Artel releases" templates/skills/super/SKILL.md` prints lines 19,
+      152 and 220; whether a real super agent follows it is step 02-04)
+- [~] 02-07 · lead, since 2026-11-13 · Installation at the latest release: `install/artel-up.sh` clones the
+      origin, runs `artel update --apply --to <--artel-ref, default release>` before `artel init`, passes
+      `--update branch:<name>|off` for another ref, replaces an ssh origin by its https form when that is
+      readable without a key and otherwise mounts the host clone; `docs/install.md` sections 1.6, 4.2 and 8.3.
+      Done so far: `bash -n install/artel-up.sh`; the two commands the script runs inside are checks 1 and 2 of
+      `tests/update-smoke.sh`. Open: the script itself on an Incus host (02-04).
+- [ ] 02-08 · user · Cut the first release: rename `## Unreleased` in `CHANGELOG.md` to `## v0.1.0 · <date>`,
+      tag, push `main` and the tag, `gh release create` (CLAUDE.md, "Releases"). Until then origin has no
+      release tags (`git ls-remote --tags origin` printed nothing on 2026-11-13) and an installation stays on
+      the default branch with the line "origin has no release tags".
+- [ ] 02-04 · lead · On a Linux host with Incus: `artel-up.sh` puts a container at the latest release; a second
+      release appears; a timer run of the super agent applies it and closes the review; a release with a broken
+      command is rolled back; an installation made before releases (on a branch) moves to the release.
+      Depends on: 02-08.
 - [ ] 02-02 · lead · `artel brief super` and `artel prompts diff`.
-- [ ] 02-03 · lead · Super skill: "Collection" step reads the brief; live session runs `artel brief` on request.
-      Template config.yaml: `prepare: artel brief super`, `{{PREPARE}}` in the prompt.
-- [ ] 02-04 · lead · Mock on a Linux host: update available, applied, rolled back, brief with and without changes.
+- [ ] 02-03 · lead · Super skill: "Collection" step reads the brief, which carries the `artel update` line; live
+      session runs `artel brief` on request. Template config.yaml: `prepare: artel brief super`, `{{PREPARE}}`
+      in the prompt.
 - [ ] 02-05 · lead · Optional: extend the brief with journal counts since the last mark, escalations, paused
       agents, cached quotas.
 
@@ -673,6 +712,8 @@ Steps:
 | Linking whole third-party skill libraries into a project | rejected 2026-10-27 (report 08): skill shadowing cost up to 21% at 202 skills; a project activates individual skills |
 | Installing third-party skills through `npx skills`, ClawHub or other marketplaces | rejected 2026-10-27 (report 08): no commit pin, scanners bypassed in under an hour; submodules pinned here and reviewed on bump |
 | Vendoring Claude plugins (hooks, commands, MCP) from skill libraries | rejected 2026-10-27 (report 08): they do nothing in Codex, agy and opencode and grant privileges in Claude Code; only skill directories are used |
+| `artel update --apply` refreshing skill copies, identities or config by itself | rejected 2026-11-13 (user): a project has its own pipelines and tuning, so the command moves only `artel/` and the super agent decides per change what the project adopts |
+| The GitHub Releases API as the source of releases | rejected 2026-11-13: tags read through git need no token, work for forks, private mirrors and a mounted host clone, and a GitHub release always has a tag |
 | Using gstack tools or skills as is | rejected 2026-11-13: they need Bun and `~/.gstack`, and every skill carries a shared preamble of about 800 lines (update check, telemetry, sessions); phase 12 ports the mechanisms instead |
 | gstack remote telemetry, gbrain memory sync, developer and taste profiles | rejected 2026-11-13: they phone home, duplicate `agents/` or serve one interactive human |
 | Git merge driver that unions appended JSONL lines (gstack `bin/gstack-jsonl-merge`) | deferred 2026-11-13: `agents/` has one writer branch in one container; revisit if projects get parallel working copies |

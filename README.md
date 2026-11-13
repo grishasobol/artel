@@ -66,7 +66,8 @@ skills/         the super skill (/super from a live session) and the consilium s
                 models run by a driver script); symlinked into the skill directories of all harnesses
                 (.claude, .codex, .agents, .gemini/config, .config/opencode, .opencode)
 src/            the project's code: git submodules and directories mounted from the host. All work happens here
-artel/          this repository as a submodule: charter, the artel command (in PATH), templates, prompt library
+artel/          this repository as a submodule at its latest release: charter, the artel command (in PATH),
+                templates, prompt library
 scratch/        drafts, outside git
 ```
 The root and `agents/` are git repositories without a remote: the history of every run is committed
@@ -76,13 +77,15 @@ project's own repositories under `src/`.
 ## Structure of this repository
 ```
 README.md, charter.md, todo.md        overview, the agents' charter, the work plan of artel itself
+CHANGELOG.md                          release notes, read by the super agent of a running project after an update
 .agents/skills/artel-create/          the installer skill; .claude/.codex/.opencode/skills link to it
 docs/install.md                       installer instruction (quiz) and a description of the super agent
 docs/harness-auth-guide.md            how to log the four harnesses in automatically inside the container
 docs/channel.md, docs/research/       the file protocol with the concierge session; a survey of comparable systems
 bin/artel                             the CLI (python3 + PyYAML): init, link, run, register, quota, notify, ask, …
 install/provision-base.sh             the artel-base image (inside: install/inside/provision.sh)
-install/artel-up.sh                   the project container: mounts, GPU, noVNC, artel clone, artel init
+install/artel-up.sh                   the project container: mounts, GPU, noVNC, artel clone at the latest
+                                      release, artel init
 install/auth-transfer.sh              credential transfer into the container (codex/opencode/agy from the host,
                                       Claude only by a token from auth.json; keys are never read)
 install/apply-auth.sh                 login setup inside the container from auth.json
@@ -105,7 +108,7 @@ and a hard limit), `schedule` (slots and their load, agents with tasks and timer
 --apply` (systemd --user timers from `config.yaml` plus the quota cache timer), `quota` (a snapshot of the
 quotas of the four harnesses: from a cache younger than 10 minutes, or a full poll with `--fresh` taking up
 to a minute), `notify` and `ask` (contact with the user), `team`, `summary`, `journal`, `lock`, `snapshot`,
-`commit`, `env`.
+`commit`, `env`, `update` (keeps `artel/` at the latest release of its origin, see “Releases and updating”).
 
 Running an agent: `artel run <agent> [--task name]` reads `agents/config.yaml`, runs the prepare script, takes
 the slot, substitutes the window, the budget and the task name into the prompt, starts the harness, kills it
@@ -121,15 +124,32 @@ failure at harness login goes to the user channel immediately; a worker agent is
 in a row until `artel run <agent> --force` (counters in `agents/state/failures.json`). Harness login variables
 from `~/.config/artel/auth.env` (written by `apply-auth.sh`) are passed to children.
 
-## Updating
-Inside the container: `git -C /home/artel/artel pull`. The command, the charter and the templates update at
-once; a run in progress picks the new code up at its next `artel` call. Files in `agents/` and `skills/`
-created at installation belong to the project: a repeated `artel init` overwrites nothing and only adds what
-is missing. `artel skills --apply` refreshes the copies of the template skills (`super`, `consilium`) that
-nobody edited (the previous version goes to `agents/history/`), removes copies of skills that no longer exist
-in the templates, and leaves an edited copy alone with a diff command. The prompt library `artel/templates/prompts/` is read in
-place and updates with the submodule; `artel prompts status` shows which identities have changed sources.
-`artel env` shows the running commit.
+## Releases and updating
+A release is a tag `vMAJOR.MINOR.PATCH` in this repository, published as a GitHub release; `CHANGELOG.md` holds
+its notes, written for the super agent of a running project. The installation clones the repository into the
+container and puts `artel/` at the latest release (`install/artel-up.sh --artel-ref` names another version).
+
+From then on the project keeps itself current. In every timer run the super agent calls `artel update`: it
+fetches the origin and says which release is installed and whether a newer one exists. `artel update --apply`
+moves `artel/` to the new release, checks that the new command starts and still reads the project, returns to the
+previous release when it does not, and prints a review report: release notes, changed files by area, identities
+whose sources changed, skill copies that differ from their templates. The command, the charter and the prompt
+library are new at once (a run in progress picks the new code up at its next `artel` call); nothing in `agents/`
+or `skills/` is touched. What the project takes from the release is the super agent's decision, change by change:
+a project has its own goal, pipelines and tuning, and not every change suits it. `artel update --done "<decisions>"`
+closes the review, and the journal keeps what was adopted and what was declined.
+
+The tools for carrying a change over: `artel skills --apply` refreshes the copies of the template skills (`super`,
+`consilium`) that nobody edited (the previous version goes to `agents/history/`), removes copies of skills that
+no longer exist in the templates, and leaves an edited copy alone with a diff command; `artel prompts status`
+shows which identities have changed sources; a repeated `artel init` overwrites nothing and only adds what is
+missing. `artel env` shows the installed release and commit.
+
+All of this is the default, like everything else artel lays out. `artel.update` in `agents/config.yaml` switches
+a project to a branch (`branch:<name>`) or stops updates (`off`); `artel update --apply --to <tag>` pins a version;
+an `artel/` with local changes or commits of its own is never overwritten, the command refuses and says why. The
+user may reshape the layout, the pipelines and the way the super agent and the other agents work at installation
+or at any later time; such decisions go into `goal.md` or `agents/rules.md` and no update reverts them.
 
 ## Status
 The core (slot and timer runs, super agent iterations, the concierge session as a service, the quota snapshot

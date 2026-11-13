@@ -3,21 +3,26 @@
 #
 #   install/artel-up.sh <name> [--user <name>] [--image <alias>]
 #                 [--mount <host directory>:<path inside>[:ro]]... [--mem 8GiB] [--cpu N]
-#                 [--novnc <port>] [--gpu] [--artel <clone directory>] [--artel-url <git url>] [--skip-image-check]
+#                 [--novnc <port>] [--gpu] [--skip-image-check]
+#                 [--artel <clone directory>] [--artel-url <git url>] [--artel-ref release|<tag>|<branch>|<commit>]
 #
 # The container is named artel-<name>. The user project is the selected user's home directory
 # inside the container: it contains goal.md, agents/, src/, skills/, artel/ and scratch/. The project
 # decides which of these are mounted from the host: --mount is optional and can be repeated.
 # The path inside can be absolute or relative to the home directory (for example, src/project). Files on
-# the host belong to whoever runs the script (shift=true). The artel repository is cloned to
-# <home>/artel. --novnc sets the host port (noVNC is always 6080 inside), one per project.
+# the host belong to whoever runs the script (shift=true). The artel repository is cloned to <home>/artel
+# from the origin of this clone (--artel-url names another) and put at its latest release, a tag
+# vMAJOR.MINOR.PATCH; --artel-ref names another version, and the project then follows that branch or stays
+# pinned (artel.update in agents/config.yaml). --novnc sets the host port (noVNC is always 6080 inside),
+# one per project.
 #
 #   install/artel-up.sh demo --mount ~/work/demo:src/demo --gpu --novnc 6081
 set -euo pipefail
-usage() { sed -n 2,15p "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n 2,18p "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 NAME="${1:-}"; [ -n "$NAME" ] && [ "${NAME#-}" = "$NAME" ] || usage; shift
 USER_IN=""; USER_SET=0; IMAGE="artel-base"
 MOUNTS=(); MEM="8GiB"; CPU=""; NOVNC=""; GPU=0; ARTEL="$(cd "$(dirname "$0")/.." && pwd)"; ARTEL_URL=""; IMAGE_CHECK=1
+ARTEL_REF="release"
 val() { [ $# -ge 2 ] && [ -n "$2" ] || { echo "flag $1 requires a value"; usage; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -30,6 +35,7 @@ while [ $# -gt 0 ]; do
     --gpu) GPU=1; shift;;
     --artel) val "$@"; ARTEL="$2"; shift 2;;
     --artel-url) val "$@"; ARTEL_URL="$2"; shift 2;;
+    --artel-ref) val "$@"; ARTEL_REF="$2"; shift 2;;
     --skip-image-check) IMAGE_CHECK=0; shift;;
     *) echo "unknown argument $1"; usage;;
   esac
@@ -51,13 +57,32 @@ if [ "$IMAGE_CHECK" = 1 ] && [ -n "$WANT_LAYOUT" ] && [ "$HAVE_LAYOUT" != "$WANT
   echo "rebuild it: install/provision-base.sh (10–20 minutes). Start from the old image despite the check: --skip-image-check"
   exit 2
 fi
-ARTEL_SRC_MOUNT=0
+ARTEL_SRC_MOUNT=0; ARTEL_FROM_CLONE=0
 if [ -z "$ARTEL_URL" ]; then
+  ARTEL_FROM_CLONE=1
   [ -d "$ARTEL" ] || { echo "artel repository not found: $ARTEL (use --artel <clone directory>)"; exit 2; }
   ARTEL="$(cd "$ARTEL" && pwd)"
   if ! ARTEL_URL="$(git -C "$ARTEL" remote get-url origin 2>/dev/null)" || [ -z "$ARTEL_URL" ]; then
     ARTEL_URL=/mnt/artel-src
     ARTEL_SRC_MOUNT=1
+  fi
+fi
+# The container has no SSH key, and it fetches releases from this URL for the rest of its life: an ssh address
+# is replaced by its https form when that is readable without credentials, otherwise by a mount of this clone.
+ARTEL_HTTPS=""
+case "$ARTEL_URL" in
+  git@*:*) ARTEL_HTTPS="https://$(printf '%s' "${ARTEL_URL#git@}" | sed 's|:|/|')";;
+  ssh://git@*) ARTEL_HTTPS="https://${ARTEL_URL#ssh://git@}";;
+esac
+if [ -n "$ARTEL_HTTPS" ]; then
+  if GIT_TERMINAL_PROMPT=0 git ls-remote -q "$ARTEL_HTTPS" HEAD >/dev/null 2>&1; then
+    ARTEL_URL="$ARTEL_HTTPS"
+  elif [ "$ARTEL_FROM_CLONE" = 1 ]; then
+    echo "note: $ARTEL_URL needs a key the container does not have and $ARTEL_HTTPS is not readable without one:"
+    echo "      the container clones from this clone ($ARTEL, mounted read-only) and takes its releases from it"
+    ARTEL_URL=/mnt/artel-src; ARTEL_SRC_MOUNT=1
+  else
+    echo "--artel-url $ARTEL_URL needs a key the container does not have: pass an https address, or --artel <clone directory> alone"; exit 2
   fi
 fi
 if [ -n "$NOVNC" ] && ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$NOVNC\$"; then
@@ -124,13 +149,20 @@ fi
 # The artel clone initializes the project home directory after systemd starts.
 INIT_OUTPUT=""
 set +e
-INIT_OUTPUT="$(incus exec "$C" -- sudo -iu "$USER_IN" env ARTEL_URL="$ARTEL_URL" PROJECT_NAME="$NAME" bash -se <<'INNER'
+INIT_OUTPUT="$(incus exec "$C" -- sudo -iu "$USER_IN" env ARTEL_URL="$ARTEL_URL" ARTEL_REF="$ARTEL_REF" PROJECT_NAME="$NAME" bash -se <<'INNER'
 set -euo pipefail
 cd "$HOME"
+FOLLOW=release
 if [ ! -e "$HOME/artel" ]; then
   git -c protocol.file.allow=always clone -q "$ARTEL_URL" "$HOME/artel"
+  # The clone is on the default branch: put it at the requested version (by default the latest release; a
+  # repository without release tags stays on its default branch). A branch is followed, a tag or commit is pinned.
+  python3 "$HOME/artel/bin/artel" update --apply --to "$ARTEL_REF"
+  if [ "$ARTEL_REF" != release ]; then
+    if git -C "$HOME/artel" show-ref --verify -q "refs/remotes/origin/$ARTEL_REF"; then FOLLOW="branch:$ARTEL_REF"; else FOLLOW=off; fi
+  fi
 fi
-python3 "$HOME/artel/bin/artel" init --project "$PROJECT_NAME" --artel-url "$ARTEL_URL"
+python3 "$HOME/artel/bin/artel" init --project "$PROJECT_NAME" --artel-url "$ARTEL_URL" --update "$FOLLOW"
 INNER
 )"
 INIT_STATUS=$?
@@ -145,6 +177,7 @@ cat <<MSG
 Done: $C ($st). Snapshot ‘fresh’ created.
   user project: $HOME_IN (goal.md, agents/, src/, skills/, artel/, scratch/)
 MSG
+printf '  artel:        %s\n' "$(incus exec "$C" -- sudo -iu "$USER_IN" artel update 2>&1 | head -1)"
 for i in "${!M_SRC[@]}"; do printf '  mounted:      %s  <-  %s (%s)\n' "${M_DST[$i]}" "${M_SRC[$i]}" "${M_RO[$i]}"; done
 [ "$ARTEL_SRC_MOUNT" = 1 ] && printf '  mounted:      /mnt/artel-src  <-  %s (ro)\n' "$ARTEL"
 [ -n "$NOVNC" ] && printf '  agent screen: http://<host address>:%s/vnc.html\n' "$NOVNC"

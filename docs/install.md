@@ -63,7 +63,10 @@ Check silently; tell the user only the result and what to do about it.
    Claude: its container login always uses a `claude setup-token` token; see step 5). A missing harness is not a
    problem: claude, codex and opencode are installed in the image, agy is copied from the host when present.
 6. **artel repository.** `git -C "$ARTEL_REPO" remote get-url origin`. If origin exists, the container clones
-   from it; otherwise the script mounts this clone read-only and clones from it.
+   from it and is put at its latest release (a tag `vMAJOR.MINOR.PATCH`); the container keeps fetching releases
+   from that address, so an ssh address is replaced by its https form when that is readable without a key.
+   Without an origin, or when neither form is readable from the container, the script mounts this clone
+   read-only and the container takes its releases from it.
 
 ## 2. Project conversation
 
@@ -123,7 +126,10 @@ Explain that an `artel-<name>` container will be created, and clarify each item 
 2. **Container.** `"$ARTEL_REPO"/install/artel-up.sh <name> [--mount …] [--mem …] [--cpu …] [--novnc …]
    [--gpu] [--user <name>] [--image <alias>]`. The script creates the container, mounts folders, clones artel
    into the user's home directory (`/home/artel/artel` for the default user; the user name comes from the
-   image's `artel.user` property, `--user` overrides it) and runs `artel init` there. Every `sudo -iu artel`
+   image's `artel.user` property, `--user` overrides it), puts the clone at the latest release of its origin
+   and runs `artel init` there. The super agent keeps `artel/` at the latest release afterwards (part 2). If the
+   user wants another version, `--artel-ref <branch|tag|commit>` installs it: the project then follows that
+   branch, or stays pinned to that tag or commit (`artel.update` in `agents/config.yaml`). Every `sudo -iu artel`
    below uses that name. This lays out the home folder: a git repository with an allowlist, `artel` and `agents`
    submodules, `skills/` symlinked into every harness, `AGENTS.md`/`CLAUDE.md`, a `goal.md` template,
    `agents/` from templates (`planning/`, `journal.md`, `environment.md`, `config.yaml`, concierge prompt).
@@ -246,7 +252,9 @@ commands when they ask. Everything else is the same, with these replacements.
    idempotent and keeps the existing user. Without sudo, install only what is missing with the harnesses' own
    user-level installers and ask the user to get an administrator for `python3-yaml`, `git`, `tmux` and linger.
 3. **Layout instead of section 4.** The artel clone must be `~/artel`: `git clone <url> ~/artel` (or move the
-   clone there), then `~/artel/bin/artel init --project <name> [--src <url>]` from the home directory.
+   clone there), `~/artel/bin/artel update --apply --to release` from the home directory to put it at the
+   latest release (skip it, and pass `--update branch:<name>` or `--update off` to `init`, if the user wants
+   another version), then `~/artel/bin/artel init --project <name> [--src <url>]` from the home directory.
    `artel init` adds the PATH line to `~/.profile` and `~/.bashrc` when `artel` is not found; open a new
    shell. Code from the host is mounted by the user on the host: `incus config device add <container> src
    disk source=<host path> path=/home/<user>/src/<name> shift=true`.
@@ -278,9 +286,18 @@ schedule with `artel register --apply` (it creates timers in the container).
 help, and quotas. Assesses whether the plan is moving, whether completed work is confirmed by evidence (commits,
 tests, artifacts), and how much has been spent. Consolidates everything into the main `planning/` files. Adjusts
 agent prompts, scripts, team composition and schedule, and the environment (it may install packages and start
-services in the container). Writes to the user only about what cannot be resolved internally, and reports in the
+services in the container). Checks whether artel has a newer release (`artel update`); when it does, moves
+`artel/` to it, reads what changed and decides, change by change, what this project adopts in its pipelines,
+skills, identities and configuration and what it declines, because not every change suits every project.
+Writes to the user only about what cannot be resolved internally, and reports in the
 mode specified in `rules.md`. Within the scope of `goal.md`, it is free to try different approaches; for anything
 outside `goal.md`, it proposes the change to the user instead of doing it itself.
+
+**All of it is a default.** The user may change the layout, the pipelines, the schedule and the way the super
+agent and the other agents work, during the installation or at any time later: by telling the super agent, or
+by writing the decision into `goal.md`. Such a decision outranks the super skill and the prompt library, and
+artel updates do not revert it; an update can also be switched off or pinned (`artel.update` in
+`agents/config.yaml`).
 
 **What it does not do.** It does not edit `goal.md` without direct permission. It does not raise quota thresholds
 above those set by the user. It does not bypass subscription limits. It does not disable the communication channel.

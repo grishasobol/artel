@@ -15,9 +15,10 @@ opencode see it as `AGENTS.md` (symlinks are created by `artel link`).
   (`/consilium [deep] <request>`: a council of models that returns one agreed answer), linked into all harnesses.
 - `src/` contains project code: submodules and host-mounted directories. All project work happens here; commits
   to project repositories are made only from here.
-- `artel/` is the artel system (submodule): charter `artel/charter.md`, `artel` command (`artel/bin`, in PATH),
-  prompt library `artel/templates/prompts/` (catalogue: `artel prompts`), and templates. Do not edit it; record
-  defects and feature requests with `artel journal --type artel-issue`.
+- `artel/` is the artel system (submodule, kept at a release of its origin by `artel update`): charter
+  `artel/charter.md`, `artel` command (`artel/bin`, in PATH), prompt library `artel/templates/prompts/`
+  (catalogue: `artel prompts`), and templates. Do not edit it by hand; record defects and feature requests with
+  `artel journal --type artel-issue`.
 - `scratch/` contains drafts and large data; it is outside Git.
 
 ## Rules for any session here

@@ -8,7 +8,8 @@ It is usually the `artel` user's home directory inside the Incus container `arte
   scripts. A separate Git repository (submodule); run history is committed automatically.
 - `skills/` contains agent skills linked into all harnesses by symlinks (`artel link`). Invoke the super agent as `/super`.
 - `src/<repository>/` contains project code: Git submodules and host-mounted directories. All work happens here.
-- `artel/` is the artel system: charter `artel/charter.md`, `artel` command, and templates. A submodule; update with `git -C artel pull`.
+- `artel/` is the artel system: charter `artel/charter.md`, `artel` command, and templates. A submodule at a release of
+  its origin; `artel update` shows whether a newer release exists, and the super agent applies it in its runs.
 - `scratch/` contains drafts: worker worktrees, clones of other projects, and large data. It is not tracked by Git.
 - `AGENTS.md` (`CLAUDE.md` symlink) is the introduction for any live harness session here.
 

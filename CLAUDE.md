@@ -17,7 +17,7 @@ what a developer needs and cannot derive from them.
   `artel help` and must list every subcommand.
 - `install/` · bash for the Incus host (`provision-base.sh`, `artel-up.sh`, `auth-transfer.sh`) and for the
   inside of the container (`install/inside/`, `apply-auth.sh`). Every script starts with a usage comment;
-  `artel-up.sh` prints it with `sed -n 2,15p`, so keep that line range in sync when editing its header.
+  `artel-up.sh` prints it with `sed -n 2,18p`, so keep that line range in sync when editing its header.
 - `templates/` · copied or symlinked into a user project by `artel init`, `artel team init` and
   `artel skills --apply`. `templates/prompts/` is the prompt library the super agent reads in place.
 - `.agents/skills/artel-create/` · the installer skill; `.claude`, `.codex` and `.opencode` hold symlinks to
@@ -27,7 +27,12 @@ what a developer needs and cannot derive from them.
   `README.md`.
 
 ## Conventions that are easy to break
-- Placeholders in templates are `{{UPPER_CASE}}` (`{{PROJECT}}`, `{{AGENT}}`, `{{DATE}}`, `{{PREPARE}}`,
+- Everything artel lays out in a user project is a default, not a law: the user may change the layout, the
+  pipelines and the way the super agent and the other agents work, at installation or later. New features are
+  written accordingly: a setting or a user decision in `goal.md` / `rules.md` can turn them off or reshape them,
+  and nothing overwrites what a project changed for itself (`artel update` moves only `artel/`; what a project
+  adopts from a release is its super agent's decision).
+- Placeholders in templates are `{{UPPER_CASE}}` (`{{PROJECT}}`, `{{AGENT}}`, `{{DATE}}`, `{{PREPARE}}`, `{{ARTEL_UPDATE}}`,
   `{{WINDOW_END}}`, `{{BUDGET_MIN}}`, `{{HARD_LIMIT_MIN}}`, the `{{TASK_*}}` family, and the identity
   sections in `templates/agent-prompt.md`). `bin/artel` substitutes them by exact name; renaming one means
   changing the substitution code, every template that uses it and `docs/install.md`.
@@ -55,8 +60,9 @@ bin/artel help >/dev/null
 git ls-files | xargs grep -lE "[А-Яа-яЁё]"      # expect: README.md only
 bash tests/telemetry-smoke.sh                   # run records: `artel run` with saved harness logs and a stub
 bash tests/consilium-smoke.sh                   # consilium driver with mock participants
+bash tests/update-smoke.sh                      # artel update against a local origin with release tags
 ```
-Both smoke tests need only python3 and spend no quota; where PyYAML is missing, `tests/lib-no-pyyaml/` stands in
+The smoke tests need only python3 and git and spend no quota; where PyYAML is missing, `tests/lib-no-pyyaml/` stands in
 for it (the test config is JSON).
 The behavioural check needs a Linux host because `artel` depends on `systemd --user`, Incus and the four
 harnesses. The mock used so far (todo.md step 01-13): clone, create an empty project directory, export
@@ -83,6 +89,18 @@ AST modulo string literals; a change in logic needs the mock run.
 - Delegation and review follow `templates/prompts/roles/leader.md`: one directory per worker, a verifiable
   "done" criterion, the reviewer reads the diff as a stranger and runs the checks themselves.
 - Do not spend subscription quota on exploratory tool calls that a grep answers.
+
+## Releases
+- A release is an annotated tag `vMAJOR.MINOR.PATCH` on `main`, published as a GitHub release. Running
+  installations follow these tags (`artel update`), so a tag is never moved or deleted once pushed.
+- `CHANGELOG.md` is read by the super agents of running projects right after an update. A commit that changes
+  what a running project sees (the command, the charter, a prompt module, a skill template, a project template,
+  the install scripts) adds a line to `## Unreleased`: what changed and what a project may want to do about it.
+  Research reports, plan edits and tests need no line.
+- Cutting a release, only when the user asks: rename `## Unreleased` to `## vX.Y.Z · <date>` and open a new empty
+  `## Unreleased`, run the checks, commit, `git tag -a vX.Y.Z -m vX.Y.Z`, push `main` and the tag, then
+  `gh release create vX.Y.Z --title vX.Y.Z --notes-file <that section>`. The released commit must pass
+  `bash tests/update-smoke.sh`: a release whose command does not start is rolled back by every installation.
 
 ## Git
 - `main` is the only branch; history starts at the public initial commit. Do not rewrite it.

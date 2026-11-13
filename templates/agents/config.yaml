@@ -15,6 +15,7 @@
 
 artel:
   project: {{PROJECT}}
+  update: {{ARTEL_UPDATE}}     # what artel/ follows: release (the latest release of its origin) | branch:<name> | "off"; command: artel update
   git:
     autocommit: true          # after every completed timer run, commit the user project: agents/ and src/ submodule pointers
   channel:
