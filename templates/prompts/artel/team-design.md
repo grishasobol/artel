@@ -25,7 +25,7 @@ The catalog with descriptions is `artel prompts`; the module text is `artel prom
 | `artel/` | `worker`, `plan`, `channel`, `config`, `environment`, `delegation`, `team-design` | artel system mechanics |
 | `roles/` | `leader`, `developer` | how to act in a role, without artel-specific details |
 | `harness/` | `claude`, `codex`, `agy`, `opencode` | how to run a harness headlessly: commands, flags, models, accounting, pitfalls |
-| `procedures/` | `consilium` | multi-step procedures assembled from harness modules |
+| `procedures/` | `consilium` | multi-step procedures assembled from harness modules; `consilium` points to the skill of the same name |
 
 A module has frontmatter with `name`, `description`, and `requires` (modules without which it is unclear). Store
 project knowledge that you write yourself and reuse in several identities (builds, tests, data, your security rules)

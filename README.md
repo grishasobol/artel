@@ -62,8 +62,9 @@ agents/         the development process, its own git repository: rules.md (the g
                 agent), planning/ (ROADMAP, STATE, SUMMARY, VERIFICATION), team/<agent>/ (agent spheres),
                 journal.md, environment.md, config.yaml, identities agent-<name>.md, prompts/ (project
                 modules), escalations/, history/, scripts
-skills/         the super skill (/super from a live session); symlinked into the skill directories of all
-                harnesses (.claude, .codex, .agents, .gemini/config, .config/opencode, .opencode)
+skills/         the super skill (/super from a live session) and the consilium skill (/consilium: a council of
+                models run by a driver script); symlinked into the skill directories of all harnesses
+                (.claude, .codex, .agents, .gemini/config, .config/opencode, .opencode)
 src/            the project's code: git submodules and directories mounted from the host. All work happens here
 artel/          this repository as a submodule: charter, the artel command (in PATH), templates, prompt library
 scratch/        drafts, outside git
@@ -87,7 +88,8 @@ install/auth-transfer.sh              credential transfer into the container (co
 install/apply-auth.sh                 login setup inside the container from auth.json
 templates/home/                       the root of a user project: AGENTS.md, goal.md, README, gitignore
 templates/agents/                     contents of agents/: planning/, journal, environment, config, concierge
-templates/skills/                     the super skill that artel init puts into the project's skills/
+templates/skills/                     the super and consilium skills that artel init puts into the project's
+                                      skills/; consilium/consilium.py is the driver of a consilium
 templates/prompts/                    the prompt library for the super agent (artel/, roles/, harness/,
                                       procedures/), read in place
 templates/sphere/, agent-prompt.md    the sphere of a new agent and the identity skeleton (artel team init)
@@ -123,9 +125,9 @@ from `~/.config/artel/auth.env` (written by `apply-auth.sh`) are passed to child
 Inside the container: `git -C /home/artel/artel pull`. The command, the charter and the templates update at
 once; a run in progress picks the new code up at its next `artel` call. Files in `agents/` and `skills/`
 created at installation belong to the project: a repeated `artel init` overwrites nothing and only adds what
-is missing. `artel skills --apply` refreshes the copy of the `super` skill if nobody edited it (the previous
-version goes to `agents/history/`), removes copies of skills that no longer exist in the templates, and
-leaves an edited copy alone with a diff command. The prompt library `artel/templates/prompts/` is read in
+is missing. `artel skills --apply` refreshes the copies of the template skills (`super`, `consilium`) that
+nobody edited (the previous version goes to `agents/history/`), removes copies of skills that no longer exist
+in the templates, and leaves an edited copy alone with a diff command. The prompt library `artel/templates/prompts/` is read in
 place and updates with the submodule; `artel prompts status` shows which identities have changed sources.
 `artel env` shows the running commit.
 

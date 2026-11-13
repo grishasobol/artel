@@ -11,7 +11,8 @@ opencode see it as `AGENTS.md` (symlinks are created by `artel link`).
   `planning/` (ROADMAP, STATE, SUMMARY, VERIFICATION), `team/<name>/` (each agent's sphere), `journal.md`,
   `environment.md`, `config.yaml`, agent identities `agent-<name>.md`, project prompt modules `prompts/`,
   `escalations/`, `history/`, and work-management scripts. Its own Git repository.
-- `skills/` contains the `super` skill for invoking the super agent (`/super [message]`), linked into all harnesses.
+- `skills/` contains the `super` skill for invoking the super agent (`/super [message]`) and the `consilium` skill
+  (`/consilium [deep] <request>`: a council of models that returns one agreed answer), linked into all harnesses.
 - `src/` contains project code: submodules and host-mounted directories. All project work happens here; commits
   to project repositories are made only from here.
 - `artel/` is the artel system (submodule): charter `artel/charter.md`, `artel` command (`artel/bin`, in PATH),

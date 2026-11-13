@@ -61,6 +61,8 @@ snapshot/history and the "2-3 reversible changes per iteration" rule.
 - [ ] 11 · Third-party skill libraries: pinned submodules in `skills-lib/`, index, per-skill activation
 - [ ] 12 · Safeguards and procedures ported from gstack: write guard, unattended decisions, stop rules,
   secret check on commit, plan review, health check
+- [~] 13 · Consilium run by a driver script: operator outside the discussion, one session per participant
+  (since 2026-11-13; skill, driver and mock test done, checks on a Linux installation open)
 
 ### Phase 1 · Publication readiness
 Goal: every file in the repository is in English, consistent with the others, free of personal data and of
@@ -474,6 +476,57 @@ Steps:
       12-01. Done when: an observer configured from the module on the mock writes two lines and reports a
       forced drop with its category.
 
+### Phase 13 · Consilium run by a driver script
+Goal: a consilium costs its convener a few one-screen events instead of the whole discussion. The agent that
+convenes it is the operator and not a participant; two or three models, each in one harness session for the
+whole consilium, talk in a shared space in a fixed order under a script; the lead's final answer needs the
+approval of the others; limits and access are set by the operator per task.
+Source: the user's requirements of 2026-11-13 (ten points, then answers to seven questions).
+Depends on: nothing.
+Success criteria:
+- `templates/skills/consilium/` holds `SKILL.md` for the operator and the driver `consilium.py` (python3,
+  standard library only); `procedures/consilium` points to it.
+- `tests/consilium-smoke.sh` passes on any machine with python3 and spends no quota.
+- A consilium of claude, codex and agy sessions reaches an approved final answer with each participant in one
+  session, the operator reading only events.
+Steps:
+- [x] 13-01 · lead · Driver `templates/skills/consilium/consilium.py`: commands `probe`, `start`, `wait`, `reply`,
+      `status`, `run`; space `space/NNNN-author.md` numbered in the order messages are finished; each turn
+      delivers only the messages the participant has not seen; control lines `VOTE`, `DECISION`
+      (`ASK | RESEARCH | FINAL | PROCEED`), `TO-OPERATOR`; events `questions`, `checkpoint`, `request`,
+      `research-request`, `deadline`, `collapsed`, `error`, `final`; hang protection of 60 minutes of working
+      time and 30 minutes per turn, extendable by the operator. (evidence: `python3 -m py_compile
+      templates/skills/consilium/consilium.py` passes; `python3 templates/skills/consilium/consilium.py help`)
+- [x] 13-02 · lead · Mock test `tests/consilium-smoke.sh` (harness `mock`, no quota). (evidence: 2026-11-13,
+      macOS, python 3.15: `bash tests/consilium-smoke.sh` prints 12 `ok` lines and `all 12 checks passed`:
+      questions and answers, parallel research, checkpoint, objection and second final, one session per
+      participant over 19 turns, delta without own messages, brief sent once, quick run with a repaired
+      missing vote, dropped participant, lead succession and `collapsed`, deadline and `--extend`, request of
+      the lead, `hurry`, `finalize`, `say` and `abort` against a detached driver)
+- [x] 13-03 · lead · Live run on the cheapest models of the three harnesses (claude 2.1.323 haiku, codex-cli
+      0.166.0 gpt-5.6-luna low, agy 1.5.8 gemini-3.8-flash-low), macOS, 2026-11-13. (evidence: quick run, 6
+      messages, 30 s of working time, final approved by both others; full run with web research, 13 messages,
+      14 calls, 103 s: lead `PROCEED`, parallel research with links, `FINAL`, one `OBJECT`, revised `FINAL`
+      approved by both; session ids of all three unchanged between turns; `probe` printed models and both
+      quota windows of each harness in 29 s)
+- [x] 13-04 · lead · Operator skill `templates/skills/consilium/SKILL.md`; `procedures/consilium` reduced to a
+      pointer; README, `templates/home/AGENTS.md`, `artel/team-design` and two strings of `bin/artel` name the
+      skill. (evidence: `artel prompts`-visible frontmatter kept; the `bin/artel` change is string-only: AST
+      equal modulo string literals against the previous file)
+- [ ] 13-05 · lead · On a Linux installation: `artel init` and `artel skills --apply` copy `consilium.py` intact
+      (no placeholder is substituted in it), `artel link` exposes `/consilium` in every harness, and a consilium
+      started from an `artel run` reaches `final` with `--access full` where the codex sandbox cannot nest.
+      Done when: the commands and the `final` event are quoted here.
+- [ ] 13-06 · lead · Measure a real `deep` consilium on strong models: turns, working time and quota share per
+      participant, and how often the lead closes the clarify stage with `PROCEED` against the others' wish.
+      Done when: the numbers are here and the quota guidance in the skill is corrected from them.
+- [ ] 13-07 · worker · Cut the fixed context of a claude participant: each haiku turn read about 40-70 thousand
+      tokens of the convener's user settings, plugins and skills (354778 input tokens over 5 turns in 13-03).
+      Try `--setting-sources` and a bare tool list. Done when: input tokens per turn before and after are
+      recorded and login still works.
+Executor record: haiku left out the `VOTE` line once in five turns (full run of 13-03); the one-line repair
+call recovered it (`VOTE: OBJECT`). No participant failed or timed out in either live run.
+
 ## Deferred and cancelled
 | item | reason |
 |---|---|
@@ -490,4 +543,6 @@ Steps:
 | Using gstack tools or skills as is | rejected 2026-11-13: they need Bun and `~/.gstack`, and every skill carries a shared preamble of about 800 lines (update check, telemetry, sessions); phase 12 ports the mechanisms instead |
 | gstack remote telemetry, gbrain memory sync, developer and taste profiles | rejected 2026-11-13: they phone home, duplicate `agents/` or serve one interactive human |
 | Git merge driver that unions appended JSONL lines (gstack `bin/gstack-jsonl-merge`) | deferred 2026-11-13: `agents/` has one writer branch in one container; revisit if projects get parallel working copies |
+| Caps on the number of turns, question batches or research rounds built into the consilium driver | rejected by the user 2026-11-13: the operator sets limits per task and steers at checkpoints; the driver only guards against hanging (working time, turn time) |
+| The convener of a consilium as its chair and participant (the previous `procedures/consilium`) | replaced 2026-11-13 (phase 13): the chair paid for the whole discussion in its own context; the operator now reads only events |
 | Context caching across runs via `session: continue` | deferred: never tried on a live project; the brief keeps fresh sessions small instead; measure in 06-05 before deciding |

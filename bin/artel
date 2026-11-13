@@ -6,7 +6,7 @@ artel — utility commands for the artel system, agents, and the concierge sessi
 Usage: artel <command> [arguments]   (details: artel help)
 Located in ARTEL_HOME/bin: the artel repository is a submodule of the user project root (in the container
 /home/artel/artel, bin/ is in PATH). Templates come from ARTEL_HOME/templates; the super agent's prompt
-library is in ARTEL_HOME/templates/prompts (read in place); the project root has only the super skill in skills/.
+library is in ARTEL_HOME/templates/prompts (read in place); the project root has only the super and consilium skills in skills/.
 
 Commands:
   init       lay out the user project root: git, artel and agents submodules, skills/ linked into every harness
@@ -708,7 +708,7 @@ def cmd_init(a) -> None:
                  "  artel command not in PATH yet: open a new shell (PATH line added to ~/.profile and ~/.bashrc)\n" if path_lines else
                  f"  artel command not in PATH: export PATH={sh / 'bin'}:$PATH\n")
     print(f"\nDone: {root}\n  goal.md       project goal (written by the user with the installer)\n  agents/       plans, journal, config, prompts (its own git)\n"
-          f"  skills/       super skill (/super), linked into every harness (artel link updates links)\n  artel/        artel system (submodule, update: git -C artel pull); prompt library templates/prompts (artel prompts)\n"
+          f"  skills/       super (/super) and consilium (/consilium) skills, linked into every harness (artel link updates links)\n  artel/        artel system (submodule, update: git -C artel pull); prompt library templates/prompts (artel prompts)\n"
           f"  src/          project repositories (submodules or mounts)\n" + path_hint)
 
 
