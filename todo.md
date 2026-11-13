@@ -514,18 +514,42 @@ Steps:
       skill. (evidence: `artel prompts`-visible frontmatter kept; the `bin/artel` change is string-only: AST
       equal modulo string literals against the previous file)
 - [ ] 13-05 · lead · On a Linux installation: `artel init` and `artel skills --apply` copy `consilium.py` intact
-      (no placeholder is substituted in it), `artel link` exposes `/consilium` in every harness, and a consilium
-      started from an `artel run` reaches `final` with `--access full` where the codex sandbox cannot nest.
+      (no placeholder is substituted in it), `artel link` exposes `/consilium` in every harness, a consilium
+      started from an `artel run` reaches `final` with `--access full` where the codex sandbox cannot nest, and
+      the concierge service comes up with `--strict-mcp-config` in its command (13-08).
       Done when: the commands and the `final` event are quoted here.
 - [ ] 13-06 · lead · Measure a real `deep` consilium on strong models: turns, working time and quota share per
       participant, and how often the lead closes the clarify stage with `PROCEED` against the others' wish.
       Done when: the numbers are here and the quota guidance in the skill is corrected from them.
-- [ ] 13-07 · worker · Cut the fixed context of a claude participant: each haiku turn read about 40-70 thousand
-      tokens of the convener's user settings, plugins and skills (354778 input tokens over 5 turns in 13-03).
-      Try `--setting-sources` and a bare tool list. Done when: input tokens per turn before and after are
-      recorded and login still works.
+- [x] 13-07 · lead · Cut the fixed context of a claude participant: the driver starts it with
+      `--strict-mcp-config --tools <read, web, Agent>` and `--restricted` when the CLI has it. (evidence,
+      2026-11-13, claude 2.1.323, haiku: a one-word turn reads 43 424 input tokens with the old flags and 6 975
+      with the new ones, 9 872 with `Agent`; `/context` attributes the old figure to system tools, the skill list
+      and MCP definitions; the same quick consilium cost the claude participant 84 235 input tokens before and
+      15 996 after over 2 turns; the full run with web research 354 778 over 5 turns before and 143 722 over 7
+      turns after; under the new flags a read inside `--add-dir` succeeds, a read outside is refused, web search
+      answers, a sub-agent runs on sonnet, `--resume` recalls the previous turn, OAuth login still works;
+      the table is in `harness/claude`, which now makes `--strict-mcp-config` mandatory for every headless call:
+      connectors attach after the start, a several-request turn with `--tools Bash` read 6 619 tokens on the
+      first request and 61 790 to 63 937 on the later ones without the flag, 6 623 and 6 843 with it. Not
+      checked: token login in a container, see 13-05. Codex gains nothing
+      from `--ignore-user-config --ignore-rules`: 12 895 against 13 133 tokens)
+- [x] 13-08 · lead · `artel run` starts every claude agent with `--strict-mcp-config`, in the headless form and
+      in the `remote_control` service form; the new agent field `mcp_config` (path or list) becomes
+      `--mcp-config`, placed before another option because it takes several values; `artel/config` and
+      `harness/claude` describe it. (evidence, 2026-11-13, macOS: `build_harness_cmd` imported from `bin/artel`
+      prints `claude -p --input-format stream-json --output-format stream-json --verbose --strict-mcp-config
+      --effort medium --dangerously-skip-permissions --model sonnet` for a plain agent, `... --strict-mcp-config
+      --mcp-config agents/mcp.json --effort ...` with the field, and `claude --remote-control concierge --name
+      concierge --dangerously-skip-permissions --strict-mcp-config --mcp-config a.json b.json --effort medium
+      PROMPT` for the service; the headless form run live on haiku with a three-request turn: exit 0,
+      `mcp_servers: []`, no `mcp__` tools, input 39 145, 39 247 and 39 349 tokens per request, result `done`.
+      Not checked: the `remote_control` form was not started live, and no run was made in a container, see
+      13-05)
 Executor record: haiku left out the `VOTE` line once in five turns (full run of 13-03); the one-line repair
-call recovered it (`VOTE: OBJECT`). No participant failed or timed out in either live run.
+call recovered it (`VOTE: OBJECT`). No participant failed or timed out in any of the four live runs. In the
+second full run (13-07) the lead's checkpoint report after two circles was accurate ("converging, one editorial
+disagreement"), and `hurry` ended the consilium in the next circle with both approvals.
 
 ## Deferred and cancelled
 | item | reason |

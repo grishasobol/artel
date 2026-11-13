@@ -73,6 +73,7 @@ The key is the agent name (Latin letters; it is also the name of `team/<name>/` 
 | `env` | — | environment variables for the run, such as `CLAUDE_CODE_AUTO_COMPACT_WINDOW` |
 | `enabled` | `true` | `false` removes units on the next `register --apply` (at task level: only that task's timer) |
 | `cmd` | — | ready-made command instead of harness assembly (a bash string or list); the task is available as `$ARTEL_TASK` |
+| `mcp_config` | — | claude only: path or list of paths to MCP config JSON files, relative to `cwd`. An agent gets these MCP servers and no others; without the field it gets none |
 | `remote_control`, `name`, `system_prompt_file`, `max_budget_usd`, `agent` | — | command assembly details: see below (`max_turns` is no longer accepted by claude) |
 
 ### Tasks
@@ -117,9 +118,12 @@ Substitutions in `prompt`: `{{TASK}}`, `{{WINDOW_END}}` (HH:MM at the end of the
   one after another. Stagger them only to control order (who goes first) or quotas.
 
 ## How the harness command is assembled
-- claude: `claude -p --verbose --input-format stream-json --output-format stream-json --effort E --model M
-  --dangerously-skip-permissions`, prompt through stdin; a live session waits for the model's background tasks and
-  closes when the turn and all background tasks are complete.
+- claude: `claude -p --verbose --input-format stream-json --output-format stream-json --strict-mcp-config
+  [--mcp-config <files>] --effort E --model M --dangerously-skip-permissions`, prompt through stdin; a live session
+  waits for the model's background tasks and closes when the turn and all background tasks are complete.
+  `--strict-mcp-config` is always passed: the MCP servers of the account, of plugins and of the project's
+  `.mcp.json` are not connected, because their tool definitions are reread on every request (`harness/claude`).
+  The servers an agent does need are named in its `mcp_config`.
 - codex: `codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c
   'model_reasoning_effort="E"' -m M -C <cwd> <prompt>` (effort is passed as given: low … max).
 - agy: `agy -p=<prompt> --output-format json --dangerously-skip-permissions --add-dir <cwd>
@@ -127,7 +131,8 @@ Substitutions in `prompt`: `{{TASK}}`, `{{WINDOW_END}}` (HH:MM at the end of the
   built into the model name, and `xhigh` and `max` collapse to `high`).
 - opencode: `opencode run <prompt> --format json --auto --dir <cwd> --variant E -m M [--agent A] [--session <id>]`.
 - `kind: service` with `remote_control: true`: `claude --remote-control <name> --name <name> --model M --effort E
-  --dangerously-skip-permissions --append-system-prompt-file <file> "<prompt>"` in the tmux session
+  --dangerously-skip-permissions --strict-mcp-config [--mcp-config <files>] --append-system-prompt-file <file>
+  "<prompt>"` in the tmux session
   `artel-<project>-<name>` on a separate tmux socket (`-L`), unit `Type=forking`, `Restart=on-failure`; `artel run`
   marks folder trust and bypass permissions as accepted in `~/.claude.json` in advance. Before starting,
   `artel run` kills the previous `claude --remote-control` with the same name so the user does not have two chats

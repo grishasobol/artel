@@ -194,24 +194,39 @@ def parse_reply(text: str) -> tuple:
 
 
 # ── harness adapters: one call is one turn of one session ────────────────────────────────────────────────────
+CLAUDE_HELP: list = []
+
+
+def claude_has(flag: str) -> bool:
+    """Whether the installed claude CLI knows a flag (older versions lack --restricted)."""
+    if not CLAUDE_HELP:
+        try:
+            CLAUDE_HELP.append(subprocess.run(["claude", "--help"], stdin=subprocess.DEVNULL, capture_output=True,
+                                              text=True, timeout=30).stdout)
+        except (OSError, subprocess.TimeoutExpired):
+            CLAUDE_HELP.append("")
+    return flag in CLAUDE_HELP[0]
+
+
 def build_cmd(d: Path, st: dict, m: dict, stem: Path, prompt: str, timeout: float) -> tuple:
     """Return (argv, stdin text or None, extra environment) for one turn of participant m."""
     acc, web, sub = st["access"], st["web"], st["subagents"]
     h, model, effort, sess = m["harness"], m["model"], m.get("effort"), m.get("session")
     if h == "claude":
-        cmd = ["claude", "-p", "--model", model, "--output-format", "json"]
+        # A lean session: only the listed built-in tools and no MCP servers. With the default tool set every
+        # turn rereads about 35 thousand tokens of tool, skill and connector definitions of the convener's setup.
+        tools = ["Read", "Grep", "Glob"] + (["WebSearch", "WebFetch"] if web else []) \
+            + ([] if sub == "off" else ["Agent"])
+        cmd = ["claude", "-p", "--model", model, "--output-format", "json", "--strict-mcp-config"]
         if effort:
             cmd += ["--effort", effort]
         if sess:
             cmd += ["--resume", sess]
         if acc == "full":
-            cmd += ["--dangerously-skip-permissions"]
-        else:
-            cmd += ["--allowedTools", "Read", "Grep", "Glob"] + (["WebSearch", "WebFetch"] if web else [])
-        deny = ([] if acc == "full" else ["Bash", "Edit", "Write", "NotebookEdit"]) \
-            + ([] if web else ["WebSearch", "WebFetch"]) + (["Agent", "Task"] if sub == "off" else [])
-        if deny:
-            cmd += ["--disallowedTools"] + deny
+            cmd += ["--dangerously-skip-permissions", "--tools"] + tools + ["Bash"]
+        else:                                   # --restricted also confines reads to cwd and --add-dir
+            cmd += (["--restricted"] if claude_has("--restricted") else []) \
+                + ["--tools"] + tools + ["--allowedTools"] + tools
         if st["read_dirs"]:
             cmd += ["--add-dir"] + st["read_dirs"]
         return cmd, prompt, ({"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"} if sub == "cheap" else {})

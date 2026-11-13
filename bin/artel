@@ -2818,11 +2818,17 @@ def build_harness_cmd(a_def: dict, prompt: str, cwd: Path, resume: str | None) -
         argv = a_def["cmd"] if isinstance(a_def["cmd"], list) else ["bash", "-lc", str(a_def["cmd"])]
         return harness, [str(x) for x in argv], False
     if harness == "claude":
+        # Only the MCP servers named in mcp_config: without --strict-mcp-config every server of the account, the
+        # plugins and the project is connected and its tool definitions are reread on each request. --mcp-config
+        # takes several values, so it stays in front of another option and never in front of the prompt.
+        mcp = a_def.get("mcp_config") or []
+        mcp = ["--strict-mcp-config"] + (["--mcp-config"] + [str(x) for x in (mcp if isinstance(mcp, list) else [mcp])]
+                                         if mcp else [])
         if a_def.get("remote_control"):
             argv = ["claude", "--remote-control"]
             if a_def.get("name"):
                 argv += [str(a_def["name"]), "--name", str(a_def["name"])]
-            argv += ["--dangerously-skip-permissions", "--effort", effort]
+            argv += ["--dangerously-skip-permissions"] + mcp + ["--effort", effort]
             if model:
                 argv += ["--model", str(model)]
             if a_def.get("system_prompt_file"):
@@ -2830,8 +2836,8 @@ def build_harness_cmd(a_def: dict, prompt: str, cwd: Path, resume: str | None) -
             if prompt:
                 argv.append(prompt)
             return harness, argv, False
-        argv = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-                "--effort", effort, "--dangerously-skip-permissions"]
+        argv = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"] \
+            + mcp + ["--effort", effort, "--dangerously-skip-permissions"]
         if model:
             argv += ["--model", str(model)]
         if resume:

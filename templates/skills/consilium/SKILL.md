@@ -50,6 +50,8 @@ harness, model and effort, and a reason to believe their quotas will last.
 - **Access is yours to set.** By default participants are read-only: they read the directories you name with
   `--read-dir`, search the web, and change nothing. `--no-web` forbids the web. `--access full` removes the
   technical restrictions and is acceptable only inside an isolated container where a harness sandbox cannot start.
+  A Claude participant runs lean: file reading, web and sub-agent tools only, without the MCP servers, skills and
+  settings of your setup, so do not plan on a participant using them.
 - **Sub-agents of participants run on cheap models only.** This is the default (`--subagents cheap`) and is stated
   to every participant as a hard rule; `--subagents off` forbids them. Never relax it in `--rules`: a sub-agent on
   a strong model burns a subscription window in minutes.

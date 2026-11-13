@@ -1,6 +1,6 @@
 ---
 name: harness/claude
-description: How to run Claude Code headless as a worker or consultant: command, models and effort, permissions, token and quota accounting, sessions, live sessions with background tasks, and restrictions on expensive sub-agents.
+description: How to run Claude Code headless as a worker or consultant: command, the mandatory --strict-mcp-config, models and effort, permissions, fixed context of a call, token and quota accounting, sessions, live sessions with background tasks, and restrictions on expensive sub-agents.
 ---
 
 # Claude Code (`claude`) as a worker
@@ -15,9 +15,20 @@ percentages (the token lacks `user:profile` scope and the quota server returns 4
 
 ## Single-turn call
 ```bash
-claude -p "<prompt>" --model sonnet --effort high --dangerously-skip-permissions \
+claude -p "<prompt>" --model sonnet --effort high --strict-mcp-config --dangerously-skip-permissions \
   --output-format json --add-dir /abs/path/project </dev/null 2>err.txt
 ```
+- **`--strict-mcp-config` goes into every headless call, without exception.** Without it the process connects every
+  MCP server of the account (claude.ai connectors such as mail, calendar and drive, and plugin servers): the worker
+  can reach them, their definitions cost tokens on every request, and with a short `--tools` list they are loaded
+  in full (see "Fixed context of a call"). A worker that needs an MCP server gets exactly that one:
+  `--strict-mcp-config --mcp-config <file.json>`. `artel run` passes the flag for every claude agent and takes the
+  files from the agent's `mcp_config` in `config.yaml`; a worker you start by hand gets the flag from you. The
+  connectors attach a few seconds after the start, so a turn
+  of one request does not show them. Measured 2026-11-13 on a turn with `--tools Bash` and several requests:
+  without the flag the first request read 6 600 tokens and every later one 61 800 or more, with 62 connector
+  tools visible to the model; with the flag 6 600 and 6 800, none visible. `claude mcp list` ignores the flag and
+  proves nothing; the check is the input tokens of the second request of a turn (`--output-format stream-json`).
 - `-p` prints the response and exits. Do not put long or untrusted text in quotes: put it in a file in the project and
   reference its path, or pass it through stdin (`claude -p < prompt.txt`).
 - Model aliases are `haiku | sonnet | opus | fable` or a full ID. Effort is `low | medium | high | xhigh | max`;
@@ -32,6 +43,32 @@ claude -p "<prompt>" --model sonnet --effort high --dangerously-skip-permissions
 - `--append-system-prompt-file <file>` adds a system prompt without replacing the built-in one. This is how the
   concierge is launched (`concierge.md`).
 - `--add-dir` grants access to directories outside cwd; Claude respects cwd, unlike agy.
+
+## Fixed context of a call
+A headless call inherits the whole setup of the account: the default tool set, MCP connectors, plugins and the
+skill list are reread on every model request of every turn. Measured on a one-word haiku turn in a setup with
+four connectors, two plugins and about 150 skills (2.1.323, 2026-11-13), total input tokens (a plugin's MCP
+server made the session wait for all servers; without one the connectors arrive from the second request on):
+
+| flags | input tokens |
+|---|---|
+| none | 43 400 |
+| `--strict-mcp-config` or `--disable-slash-commands` alone | 40 200 / 41 500 |
+| `--tools Read Grep Glob WebSearch WebFetch` without `--strict-mcp-config` | 63 600 |
+| `--strict-mcp-config --tools Read Grep Glob WebSearch WebFetch` | 8 300 |
+| the same with `--restricted` | 7 000 |
+| the same with `Agent` in `--tools` | 9 900 |
+
+- For a consultant or reviewer that only reads, name the tools with `--tools` next to the mandatory
+  `--strict-mcp-config`; list the same tools in `--allowedTools` so that web tools need no approval. With a short
+  tool list the skill list is not loaded at all.
+- Trap: `--tools` without `--strict-mcp-config` makes it worse than no flags at all. Without the tool-search tool
+  the definitions of every MCP tool are loaded in full.
+- `--restricted` ignores the user, project and local settings files (hooks and plugins with them), removes the
+  command-running tools unless `--tools` names them and confines file tools to cwd and `--add-dir`; it refuses
+  `--dangerously-skip-permissions`. Check `claude --help` for it: older versions do not have the flag.
+- Sessions resume with the same flags; `CLAUDE_CODE_SUBAGENT_MODEL=sonnet` in the environment still pins
+  sub-agents to a cheap model.
 
 ## Sessions
 - Save `session_id` from the JSON; resume with `claude -p --resume <id> "..."`. `--continue` takes the newest
@@ -48,7 +85,7 @@ sends commands longer than 10 minutes to the background and waits for notificati
 tests, run streaming mode with stdin left open:
 ```bash
 claude -p --input-format stream-json --output-format stream-json --verbose \
-  --model opus --effort xhigh --dangerously-skip-permissions
+  --model opus --effort xhigh --strict-mcp-config --dangerously-skip-permissions
 ```
 Pass the prompt as `{"type":"user","message":{"role":"user","content":"..."}}` on stdin; read events from
 stdout, and close stdin only when the turn is complete and no background tasks remain. Use this for long-running
