@@ -50,7 +50,7 @@ snapshot/history and the "2-3 reversible changes per iteration" rule.
 ## Phases
 - [~] 1 · Publication readiness (since 2026-10-25)
 - [~] 2 · Releases and the update process (since 2026-11-13; `artel update`, installation at the latest release
-  and the super skill done; first release, a run in a container and `artel brief` open)
+  the super skill and release v0.1.0 done; a run in a container and `artel brief` open)
 - [ ] 3 · Live verification of what was only mocked
 - [~] 4 · Public repository hygiene (license, history and rename done; smoke test and contribution notes open)
 - [ ] 5 · Brief and bounded state: `artel brief` as the default prepare for every agent
@@ -155,10 +155,12 @@ Steps:
       readable without a key and otherwise mounts the host clone; `docs/install.md` sections 1.6, 4.2 and 8.3.
       Done so far: `bash -n install/artel-up.sh`; the two commands the script runs inside are checks 1 and 2 of
       `tests/update-smoke.sh`. Open: the script itself on an Incus host (02-04).
-- [ ] 02-08 · user · Cut the first release: rename `## Unreleased` in `CHANGELOG.md` to `## v0.1.0 · <date>`,
-      tag, push `main` and the tag, `gh release create` (CLAUDE.md, "Releases"). Until then origin has no
-      release tags (`git ls-remote --tags origin` printed nothing on 2026-11-13) and an installation stays on
-      the default branch with the line "origin has no release tags".
+- [x] 02-08 · lead, on the user's request · Cut the first release v0.1.0: `## v0.1.0 · 2026-11-13` in
+      `CHANGELOG.md`, annotated tag, `main` and the tag pushed, GitHub release with that section as its notes.
+      (evidence: 2026-11-13, `git ls-remote --tags https://github.com/grishasobol/artel.git` without credentials
+      prints `refs/tags/v0.1.0` and `refs/tags/v0.1.0^{}` at commit 1ffe3b1; `gh release view v0.1.0` reports
+      `isDraft: false`; on a fresh https clone `artel update --apply --to release` and `artel update` both print
+      "artel v0.1.0 (1ffe3b1) · follows releases of https://github.com/grishasobol/artel.git" and "up to date")
 - [ ] 02-04 · lead · On a Linux host with Incus: `artel-up.sh` puts a container at the latest release; a second
       release appears; a timer run of the super agent applies it and closes the review; a release with a broken
       command is rolled back; an installation made before releases (on a branch) moves to the release.
