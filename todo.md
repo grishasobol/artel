@@ -58,6 +58,9 @@ snapshot/history and the "2-3 reversible changes per iteration" rule.
 - [ ] 8 · Reactive runs: chains, `watch_paths`, persistent timers
 - [ ] 9 · Evolution loop of the super agent: experiments, crystallisation, project profiles
 - [ ] 10 · Model-aware prompts: portability lint, `models/` notes, measured per-model tuning
+- [ ] 11 · Third-party skill libraries: pinned submodules in `skills-lib/`, index, per-skill activation
+- [ ] 12 · Safeguards and procedures ported from gstack: write guard, unattended decisions, stop rules,
+  secret check on commit, plan review, health check
 
 ### Phase 1 · Publication readiness
 Goal: every file in the repository is in English, consistent with the others, free of personal data and of
@@ -224,11 +227,15 @@ Steps:
 - [ ] 06-01 · lead · Parse usage from the four harness outputs in `cmd_run` (claude stream-json `usage`,
       codex `turn.completed.usage`, agy usage line, opencode) into `runs.jsonl`; outcome from the SUMMARY
       entry and exit code. Done when: a `--dry-run` with a replayed log file writes a correct record for
-      each harness (fixtures in `tests/fixtures/`).
+      each harness (fixtures in `tests/fixtures/`). Reference: gstack `test/helpers/providers/claude.ts` and
+      `gpt.ts` read the same usage fields for claude and codex; records are written through the 12-01 writer.
 - [ ] 06-02 · worker · `quota-history.jsonl` appended by `cmd_quota` on every full snapshot. Done when: the
       quota timer produces one line per 20 minutes on the mock.
 - [ ] 06-03 · lead · `artel stats` with the metrics above and the flags; block form for the brief. Done when:
-      stats over a synthetic `runs.jsonl` of 300 records match hand-computed values.
+      stats over a synthetic `runs.jsonl` of 300 records match hand-computed values. Includes the gstack
+      `gstack-specialist-stats` rule: an agent with no findings in its last 10 runs is flagged as a candidate
+      to drop, except agents on a never-flag list (security review, migrations), where an empty result is the
+      normal outcome.
 - [ ] 06-04 · lead · Super skill "Assessment": the question "how many runs produced little" is answered from
       stats, not from reading logs. Done when: the skill names the stats fields it reads.
 - [ ] 06-05 · user · Correlate cache-read tokens with subscription percent on a running installation (claude
@@ -344,8 +351,11 @@ Steps:
 - [ ] 10-02 · lead · Prompt group `models/` with four modules of behavioural deltas, for example: Claude in
       unattended runs is told it runs unattended and when to stop and ask, never asked to echo its
       reasoning; GPT-6 models are told when to delegate; open-weight models get explicit structure, one
-      worked example, a single system message and the vendor's sampling settings. Done when: `artel prompts`
-      lists the four modules, each is at most 25 lines, and every claim cites report 07 or a run.
+      worked example, a single system message and the vendor's sampling settings. A module may start with an
+      inherit line naming its base family module, so a version-specific note holds only its difference, and
+      the compiled block is headed as preferences subordinate to the charter and the identity (both from gstack
+      `model-overlays/` and `scripts/resolvers/model-overlay.ts`). Done when: `artel prompts` lists the four
+      modules, each is at most 25 lines, and every claim cites report 07 or a run.
 - [ ] 10-03 · lead · Compile rule: `artel/team-design` names `models/<family>` as a source next to
       `harness/<name>`; changing an agent's model or harness counts as a prompt change and means recompiling
       from the library; the comment on "Harness and model" in `agent-prompt.md`, the group list in the super
@@ -355,8 +365,11 @@ Steps:
 - [ ] 10-04 · lead · Curation path: the super skill tells the super agent to record a model-specific fix that
       held over several runs as `artel journal --type model-note` with the evidence; this file's "Working with
       the plan" notes in `CLAUDE.md` describe promoting a note into `models/*` and pruning notes a new model
-      generation no longer needs. Done when: the super skill names the entry type and the condition, and
-      `CLAUDE.md` describes the promotion.
+      generation no longer needs. A note carries a key, a confidence from 1 to 10 and a source (`observed`,
+      `user-stated`, `inferred`, `cross-model`); a newer note with the same key supersedes the older one, and
+      observed or inferred notes lose weight with age (the shape of gstack `bin/gstack-learnings-log` and
+      `gstack-learnings-search`). Done when: the super skill names the entry type, its fields and the
+      condition, and `CLAUDE.md` describes the promotion.
 - [ ] 10-05 · lead · Per-model tuning of an identity as an experiment: the "Tuning an identity" section of
       `artel/team-design` requires a hypothesis, the `artel stats` metric it should move and a run budget,
       and uses `artel experiment` for rollback. Depends on: 06-03, 09-01. Done when: the section names the
@@ -364,6 +377,102 @@ Steps:
 - [ ] 10-06 · user · On a running installation with an opencode worker: share of runs ending `advanced`
       versus `noop` or `failed` per model, before and after applying `models/open-weights`. Depends on:
       06-01, 10-03. Done when: the numbers and the keep-or-revert decision are recorded here.
+
+### Phase 11 · Third-party skill libraries
+Goal: a project can use curated skills from vetted public libraries in all four harnesses without fetching
+libraries it does not need, without floating versions and without linking whole libraries.
+Source: `docs/research/08-third-party-skill-libraries.md` (sections 3 to 5).
+Depends on: 10-01 for the lint checks in 11-04; nothing for the rest.
+Success criteria:
+- `skills-lib/` holds the 31 submodules of report 08, section 3, each pinned, with `update = none` and
+  `shallow = true`; a fresh `git clone --recurse-submodules` of artel fetches none of them.
+- `skills-lib/index.tsv` lists every skill of every submodule and known source at its pinned commit, and
+  `grep` over it finds a skill by topic without any library fetched.
+- On a mock project one vendored skill is active through a symlink and one adapted copy carries its upstream
+  library, commit and path; `artel link` exposes both to all four harnesses.
+- A pin bump is one commit here whose message names the library, and its new scripts, hooks and privilege
+  fields are listed by a command before the commit.
+Steps:
+- [ ] 11-01 · lead · Add the 31 submodules under `skills-lib/<group>/<owner>-<repo>` (groups `core`, `work`,
+      `research`, `security`, `platform`) with `update = none` and `shallow = true`; README layout and the
+      "What is where" list in `CLAUDE.md` name `skills-lib/`. Done when: `git submodule status` lists 31
+      entries and a fresh clone with `--recurse-submodules` has empty `skills-lib/*/*` directories.
+- [ ] 11-02 · worker · `artel skills index` regenerates `skills-lib/index.tsv` from the GitHub API at the
+      pinned commits (submodules and the known sources of report 08, section 4): library, group, path, name,
+      description cut to 200 characters, licence, scripts yes or no, `allowed-tools` or `hooks` yes or no.
+      Done when: the file has one row per `SKILL.md` (2,725 for the submodules at the current pins) and
+      `grep -c` per library matches the tree count.
+- [ ] 11-03 · worker · `artel skills fetch <library>` initialises one submodule shallowly; `artel skills use
+      <library>:<path>` links it into the project's `skills/`; `artel skills adapt` copies it and writes the
+      provenance into frontmatter `metadata`; `artel skills --apply` leaves both alone. Done when: the mock
+      run of `CLAUDE.md` plus these three commands shows the skill in `.claude/skills` and `.agents/skills`.
+- [ ] 11-04 · lead · Review support: `artel skills review <library>` (and `--since <old-commit>` for a bump)
+      lists scripts, binaries, archives, hooks, `allowed-tools` and name/directory mismatches; `artel lint`
+      (10-01) runs over linked and adapted skills. Done when: the command reports the known findings of report
+      08 (four name mismatches in vercel-labs/agent-skills, hooks in obra/superpowers).
+- [ ] 11-05 · lead · Choice and adaptation rules: `docs/install.md` part 1 tells the installer to fetch the
+      groups that match `goal.md`; the super skill tells the super agent to activate few skills, read every
+      bundled file of a skill with scripts or privilege fields before linking, record each choice with its
+      reason in `agents/environment.md`, and treat an adaptation as a measured delta (10-05). Done when: grep
+      finds `skills-lib` and `environment.md` in both texts.
+- [ ] 11-06 · user · On a Linux host: Claude Code, Codex, agy and opencode each invoke one vendored skill
+      reached through `skills/` symlinks into `artel/skills-lib/`. Done when: the four outputs are recorded
+      here (report 08, section 6: symlink handling in agy and opencode is undocumented).
+
+### Phase 12 · Safeguards and procedures ported from gstack
+Goal: what agents write cannot carry instructions to the next agent, a secret never reaches the history, an
+agent knows which decisions it may take alone and when to stop trying, and the super agent has procedures to
+review its plan and watch project health.
+Source: garrytan/gstack 1.62.0.0 (commit d078622, MIT), files named in each step. Nothing is copied as is:
+the tools need Bun and `~/.gstack`; each mechanism is rewritten in python3 with the standard library or as a
+prompt module, and ported code keeps the MIT notice of its source.
+Depends on: nothing for 12-01 to 12-04; phase 6 for the trend in 12-06.
+Success criteria:
+- `artel journal`, `artel summary` and `artel escalate` refuse text with instruction-like phrases and name
+  the matched pattern; JSONL files written by artel stay parseable under concurrent writers.
+- `artel commit` refuses to commit an added line that matches a high-tier secret pattern and reports file
+  and line without the value.
+- The library has `procedures/unattended-decisions`, `procedures/plan-review` and
+  `procedures/health-check`; the charter names one-way doors; `artel/worker` names the stop rules.
+Steps:
+- [ ] 12-01 · lead · Write guard: one writer in `bin/artel` for agent-written text and JSONL records rejects
+      free text that matches instruction-like patterns (port of `INJECTION_PATTERNS` in gstack
+      `lib/jsonl-store.ts`), appends each JSONL record as one line in one write, and a tolerant reader skips a
+      corrupt or truncated line. Done when: a fixture entry containing "ignore previous instructions" exits
+      non-zero and names the pattern; 10 processes appending 10 records each leave 100 parseable lines; a
+      truncated last line is skipped by the reader.
+- [ ] 12-02 · lead · `procedures/unattended-decisions`: every decision an agent takes in the user's place is
+      mechanical (taken silently), taste (taken and listed in the run's report) or a change to what the user
+      asked for (never taken; it goes to `artel ask` or an escalation with what was asked, what is proposed,
+      why, and the cost of being wrong); decisions are logged with `artel journal --type decision`. The
+      charter names one-way doors (recursive delete, force push, branch deletion, data-losing migration,
+      anything outside the agent's sphere) as always escalated, and the rule "delete only what you can show
+      you created". Source: gstack `autoplan/SKILL.md` 915-1024, `scripts/one-way-doors.ts`,
+      `lib/staging-guard.ts`. Done when: `artel prompts` lists the module, grep finds "one-way" in `charter.md`,
+      and the super skill and `artel/worker` reference the module.
+- [ ] 12-03 · lead · Stop rules in `artel/worker`: three refuted root-cause hypotheses end the attempt; in a
+      fix loop, a risk score (reverts, fixes touching more than three files, edits to unrelated files) above
+      20% or 50 fixes in one run ends it; the run ends `blocked` with the evidence and an escalation instead
+      of another attempt. Source: gstack `investigate/SKILL.md` 960-975, `qa/SKILL.md` 1585-1600. Done when:
+      grep finds both rules in `artel/worker.md` and the outcome name matches the phase 6 vocabulary.
+- [ ] 12-04 · worker · Secret check in `cmd_commit`: high-tier patterns ported from gstack
+      `lib/redact-patterns.ts` (with its MIT notice) scan the added lines of the staged diff of `agents/` and
+      the root; a hit blocks that commit and writes an escalation with file and line, never the value; the
+      medium tier escalates and commits. Done when: fixtures with a fake cloud key and a fake private key are
+      blocked and the value appears in no output or log; a clean diff commits; `artel run` reports a blocked
+      commit as a failure.
+- [ ] 12-05 · lead · `procedures/plan-review` for the super agent whenever ROADMAP changes: the reviewed plan
+      names what already exists, what is not in scope, the minimal version and two or three alternatives with
+      a recommendation; each new path has a test line or GAP, one realistic failure and whether it would be
+      silent; steps are grouped into parallel lanes by directory with conflicts flagged. Source: gstack
+      `plan-eng-review`, `plan-ceo-review`. Done when: the module is listed, the super skill names it, and a
+      review on the mock records the not-in-scope list, gaps and lanes in the journal.
+- [ ] 12-06 · lead · `procedures/health-check` for a read-only observer agent: the project's check commands
+      are recorded once in `agents/environment.md`; each category scores 0-10 with fixed weights, a missing
+      tool is skipped and its weight redistributed; one JSONL line per run in the agent's sphere; a drop
+      names the category, the delta and the new errors. Source: gstack `health/SKILL.md` 799-1076. Depends on:
+      12-01. Done when: an observer configured from the module on the mock writes two lines and reports a
+      forced drop with its category.
 
 ## Deferred and cancelled
 | item | reason |
@@ -375,4 +484,10 @@ Steps:
 | `tasks.jsonl` replacing the Markdown planning files for every project | deferred 2026-10-27: Markdown stays the default; the registry is an option for `ops`/`pipeline` profiles (09-05) |
 | Per-harness or per-model copies of prompt modules and skills in this repository | rejected 2026-10-27 (report 07): the copies multiply with modules, harnesses and models, age with every model release, and nothing measures whether a copy beats the neutral text plus a `models/` note |
 | The super agent authoring library modules or worker skills on its own | rejected 2026-10-27 (report 07): SkillsBench measured self-written skills below no skills at all (-8 to -11.5 points); lessons come back as `model-note` entries and are curated here |
+| Linking whole third-party skill libraries into a project | rejected 2026-10-27 (report 08): skill shadowing cost up to 21% at 202 skills; a project activates individual skills |
+| Installing third-party skills through `npx skills`, ClawHub or other marketplaces | rejected 2026-10-27 (report 08): no commit pin, scanners bypassed in under an hour; submodules pinned here and reviewed on bump |
+| Vendoring Claude plugins (hooks, commands, MCP) from skill libraries | rejected 2026-10-27 (report 08): they do nothing in Codex, agy and opencode and grant privileges in Claude Code; only skill directories are used |
+| Using gstack tools or skills as is | rejected 2026-11-13: they need Bun and `~/.gstack`, and every skill carries a shared preamble of about 800 lines (update check, telemetry, sessions); phase 12 ports the mechanisms instead |
+| gstack remote telemetry, gbrain memory sync, developer and taste profiles | rejected 2026-11-13: they phone home, duplicate `agents/` or serve one interactive human |
+| Git merge driver that unions appended JSONL lines (gstack `bin/gstack-jsonl-merge`) | deferred 2026-11-13: `agents/` has one writer branch in one container; revisit if projects get parallel working copies |
 | Context caching across runs via `session: continue` | deferred: never tried on a live project; the brief keeps fresh sessions small instead; measure in 06-05 before deciding |
